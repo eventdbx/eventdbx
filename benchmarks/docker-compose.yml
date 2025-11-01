@@ -3,9 +3,15 @@ x-resource-limits: &resource_limits
   cpus: ${BENCH_CPU_LIMIT:-4}
 
 x-tmpfs-options: &tmpfs_defaults
-  o: "rw,size=${BENCH_TMPFS_SIZE:-1073741824}"
+  o: 'rw,size=${BENCH_TMPFS_SIZE:-1073741824}'
 
 services:
+  eventdbx:
+    image: thachp/eventdbx:latest
+    volumes:
+      - eventdbx-data:/var/lib/eventdbx
+    <<: *resource_limits
+
   postgres:
     image: postgres:16
     environment:
@@ -13,7 +19,7 @@ services:
       POSTGRES_PASSWORD: bench
       POSTGRES_DB: bench
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bench"]
+      test: ['CMD-SHELL', 'pg_isready -U bench']
       interval: 5s
       timeout: 3s
       retries: 10
@@ -23,12 +29,22 @@ services:
 
   mongodb:
     image: mongo:7
-    command: ["--wiredTigerCacheSizeGB", "${BENCH_MONGO_CACHE_GB:-1.0}"]
+    command: ['--wiredTigerCacheSizeGB', '${BENCH_MONGO_CACHE_GB:-1.0}']
     environment:
       MONGO_INITDB_ROOT_USERNAME: bench
       MONGO_INITDB_ROOT_PASSWORD: bench
     healthcheck:
-      test: ["CMD", "mongosh", "--username", "bench", "--password", "bench", "--eval", "db.runCommand({ping:1})"]
+      test:
+        [
+          'CMD',
+          'mongosh',
+          '--username',
+          'bench',
+          '--password',
+          'bench',
+          '--eval',
+          'db.runCommand({ping:1})',
+        ]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -36,61 +52,47 @@ services:
       - /data/db:rw,size=${BENCH_TMPFS_SIZE:-1073741824}
     <<: *resource_limits
 
-  mssql:
-    image: mcr.microsoft.com/mssql/server:2022-latest
-    environment:
-      ACCEPT_EULA: "Y"
-      SA_PASSWORD: "${BENCH_MSSQL_PASSWORD:-Eventdbx#Bench1}"
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P ${BENCH_MSSQL_PASSWORD:-Eventdbx#Bench1} -Q \"SELECT 1\"",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-    tmpfs:
-      - /var/opt/mssql:rw,size=${BENCH_TMPFS_SIZE:-2147483648}
-    <<: *resource_limits
-
   bench:
     build:
       context: ..
       dockerfile: benchmarks/Dockerfile
+    env_file:
+      - bench.toml
     environment:
-      EVENTDBX_PG_DSN: "host=postgres user=bench password=bench dbname=bench"
-      EVENTDBX_MONGO_URI: "mongodb://bench:bench@mongodb:27017/?authSource=admin"
-      EVENTDBX_MONGO_DB: "bench"
-      EVENTDBX_MONGO_COLLECTION: "events"
-      EVENTDBX_SQLITE_PATH: "/sqlite/bench.db"
-      EVENTDBX_MSSQL_DSN: "Server=mssql,1433;User ID=sa;Password=${BENCH_MSSQL_PASSWORD:-Eventdbx#Bench1};Encrypt=No;"
+      EVENTDBX_PG_DSN: 'host=postgres user=bench password=bench dbname=bench'
+      EVENTDBX_MONGO_URI: 'mongodb://bench:bench@mongodb:27017/?authSource=admin'
+      EVENTDBX_MONGO_DB: 'bench'
+      EVENTDBX_MONGO_COLLECTION: 'events'
+      EVENTDBX_CONFIG_PATH: '/eventdbx/.eventdbx/config.toml'
+      EVENTDBX_SOCKET_ADDR: 'eventdbx:6363'
     depends_on:
+      eventdbx:
+        condition: service_started
       postgres:
         condition: service_healthy
       mongodb:
         condition: service_healthy
-      mssql:
-        condition: service_healthy
     volumes:
       - ..:/workspace
-      - sqlite-data:/sqlite
+      - eventdbx-data:/eventdbx
     working_dir: /workspace
     command:
       [
-        "cargo",
-        "bench",
-        "--bench",
-        "backend_comparison",
-        "--features",
-        "bench-all",
+        'cargo',
+        '-Z',
+        'unstable-options',
+        'bench',
+        '--bench',
+        'backend_comparison',
+        '--features',
+        'bench-postgres,bench-mongodb',
       ]
     <<: *resource_limits
 
 volumes:
-  sqlite-data:
+  eventdbx-data:
     driver: local
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "rw,size=${BENCH_TMPFS_SIZE:-1073741824}"
+      o: 'rw,size=${BENCH_TMPFS_SIZE:-1073741824}'

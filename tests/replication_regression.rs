@@ -15,13 +15,16 @@ use eventdbx::{
         replication_hello, replication_hello_response, replication_request, replication_response,
     },
     replication_capnp_client::{CapnpReplicationClient, REPLICATION_PROTOCOL_VERSION},
-    replication_noise::{perform_server_handshake, read_encrypted_frame, write_encrypted_frame},
+    replication_noise::{
+        perform_client_handshake, perform_server_handshake, read_encrypted_frame,
+        write_encrypted_frame,
+    },
     snowflake::SnowflakeId,
     store::{AggregatePositionEntry, EventMetadata, EventRecord},
 };
 use futures::AsyncWriteExt;
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::{io::duplex, net::TcpListener};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 enum ListPositionsFixture {
@@ -369,6 +372,57 @@ async fn run_mock_replication_server(
     write_encrypted_frame(&mut writer, &mut noise, &bytes)
         .await
         .context("failed to send pull_events response")?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn noise_control_channel_accepts_large_payloads() -> Result<()> {
+    let token = "chunk-test-token";
+    let payload_len = 128 * 1024;
+    let mut base_payload = Vec::with_capacity(payload_len);
+    for idx in 0..payload_len {
+        base_payload.push((idx % 251) as u8);
+    }
+    let expected_payload = base_payload.clone();
+    let client_payload = base_payload;
+
+    let (client_stream, server_stream) = duplex(512 * 1024);
+
+    let client_task = {
+        let token = token.to_string();
+        async move {
+            let (client_read, client_write) = tokio::io::split(client_stream);
+            let mut reader = client_read.compat();
+            let mut writer = client_write.compat_write();
+            let mut noise = perform_client_handshake(&mut reader, &mut writer, token.as_bytes())
+                .await
+                .context("client Noise handshake failed")?;
+            write_encrypted_frame(&mut writer, &mut noise, &client_payload)
+                .await
+                .context("client failed to send payload")?;
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    let server_task = {
+        let token = token.to_string();
+        async move {
+            let (server_read, server_write) = tokio::io::split(server_stream);
+            let mut reader = server_read.compat();
+            let mut writer = server_write.compat_write();
+            let mut noise = perform_server_handshake(&mut reader, &mut writer, token.as_bytes())
+                .await
+                .context("server Noise handshake failed")?;
+            let received = read_encrypted_frame(&mut reader, &mut noise)
+                .await?
+                .context("expected encrypted payload")?;
+            Ok::<Vec<u8>, anyhow::Error>(received)
+        }
+    };
+
+    let ((), received) = tokio::try_join!(client_task, server_task)?;
+    assert_eq!(received, expected_payload);
 
     Ok(())
 }
