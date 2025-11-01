@@ -11,7 +11,6 @@ const AEAD_TAG_LEN: usize = 16;
 const HANDSHAKE_MESSAGE_MAX: usize = 1024;
 const NOISE_MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 const NOISE_MAX_PAYLOAD_LEN: usize = NOISE_MAX_MESSAGE_LEN - AEAD_TAG_LEN;
-const MAX_ENCRYPTED_CHUNK_LEN: usize = NOISE_MAX_MESSAGE_LEN;
 const CHUNK_HEADER_LEN: usize = 1;
 const MAX_CHUNK_DATA_LEN: usize = NOISE_MAX_PAYLOAD_LEN - CHUNK_HEADER_LEN;
 const CHUNK_FLAG_CONTINUE: u8 = 1;
@@ -170,10 +169,10 @@ where
                 bail!("peer closed connection while reading encrypted Noise frame");
             }
         };
-        if frame.len() > MAX_ENCRYPTED_CHUNK_LEN {
+        if frame.len() > NOISE_MAX_MESSAGE_LEN {
             bail!(
                 "encrypted Noise frame exceeds maximum length ({} bytes)",
-                MAX_ENCRYPTED_CHUNK_LEN
+                NOISE_MAX_MESSAGE_LEN
             );
         }
 
@@ -243,11 +242,11 @@ where
         }
     }
     let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_ENCRYPTED_CHUNK_LEN {
+    if len > NOISE_MAX_MESSAGE_LEN {
         bail!(
             "frame length {} exceeds allowed maximum {}",
             len,
-            MAX_ENCRYPTED_CHUNK_LEN
+            NOISE_MAX_MESSAGE_LEN
         );
     }
     let mut payload = vec![0u8; len];
@@ -350,10 +349,10 @@ pub fn read_encrypted_frame_blocking<R: Read>(
                 bail!("peer closed connection while reading encrypted Noise frame");
             }
         };
-        if frame.len() > MAX_ENCRYPTED_CHUNK_LEN {
+        if frame.len() > NOISE_MAX_MESSAGE_LEN {
             bail!(
                 "encrypted Noise frame exceeds maximum length ({} bytes)",
-                MAX_ENCRYPTED_CHUNK_LEN
+                NOISE_MAX_MESSAGE_LEN
             );
         }
         let mut buffer = vec![0u8; frame.len()];
@@ -414,11 +413,11 @@ fn read_frame_blocking<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         }
     }
     let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_ENCRYPTED_CHUNK_LEN {
+    if len > NOISE_MAX_MESSAGE_LEN {
         bail!(
             "frame length {} exceeds allowed maximum {}",
             len,
-            MAX_ENCRYPTED_CHUNK_LEN
+            NOISE_MAX_MESSAGE_LEN
         );
     }
     let mut payload = vec![0u8; len];
