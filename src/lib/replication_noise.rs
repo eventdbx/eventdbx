@@ -187,7 +187,7 @@ where
             bail!("decrypted Noise frame missing chunk flag");
         }
 
-        let (chunk_flag, chunk_payload) = buffer.split_first().expect("checked non-empty chunk");
+        let (chunk_flag, chunk_payload) = buffer.split_first().expect("checked buffer non-empty");
         let more = match *chunk_flag {
             CHUNK_FLAG_DONE => false,
             CHUNK_FLAG_CONTINUE => true,
