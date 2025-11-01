@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
