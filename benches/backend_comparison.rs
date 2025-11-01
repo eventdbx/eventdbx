@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, anyhow};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use json_patch::Patch;
 use once_cell::sync::Lazy;
 use rand::{Rng, SeedableRng, distributions::Alphanumeric, rngs::StdRng};
+use report::{Operation, Scenario};
 use serde_json::{Value, json};
 
 const AGGREGATE_TYPE: &str = "orders";
@@ -26,6 +27,209 @@ static PATCH_TEMPLATE: Lazy<Value> = Lazy::new(|| {
 static PATCH_DOC: Lazy<Patch> =
     Lazy::new(|| serde_json::from_value(PATCH_TEMPLATE.clone()).expect("patch template is valid"));
 
+mod report {
+    use once_cell::sync::Lazy;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(super) enum Operation {
+        Apply,
+        Get,
+        Patch,
+        List,
+    }
+
+    impl Operation {
+        pub(super) fn display(self) -> &'static str {
+            match self {
+                Operation::Apply => "Apply",
+                Operation::Get => "Get",
+                Operation::Patch => "Patch",
+                Operation::List => "List",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(super) enum Scenario {
+        PayloadBytes(usize),
+        SeedCount(usize),
+        ListLimit { limit: usize, events: usize },
+    }
+
+    impl Scenario {
+        pub(super) fn label(self) -> String {
+            match self {
+                Scenario::PayloadBytes(bytes) => format!("{bytes} B payload"),
+                Scenario::SeedCount(count) => format!("{count} seeded events"),
+                Scenario::ListLimit { limit, events } => format!("limit {limit}, events {events}"),
+            }
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct OperationData {
+        rows: BTreeMap<Scenario, RowData>,
+        columns: BTreeSet<String>,
+    }
+
+    #[derive(Default, Clone)]
+    struct RowData {
+        samples: BTreeMap<String, Vec<f64>>,
+    }
+
+    #[derive(Default, Clone)]
+    struct Report {
+        data: BTreeMap<Operation, OperationData>,
+    }
+
+    static REPORT: Lazy<Mutex<Report>> = Lazy::new(|| Mutex::new(Report::default()));
+
+    pub(super) fn record(
+        operation: Operation,
+        scenario: Scenario,
+        backend: &str,
+        elapsed: Duration,
+        iters: u64,
+    ) {
+        if iters == 0 {
+            return;
+        }
+
+        let per_iter = elapsed.as_secs_f64() / iters as f64;
+        let mut report = REPORT.lock().expect("report mutex poisoned");
+        let op_data = report.data.entry(operation).or_default();
+        op_data.columns.insert(backend.to_string());
+        let row = op_data.rows.entry(scenario).or_default();
+        row.samples
+            .entry(backend.to_string())
+            .or_default()
+            .push(per_iter);
+    }
+
+    pub(super) fn print_summary() {
+        let snapshot = {
+            let report = REPORT.lock().expect("report mutex poisoned");
+            report.data.clone()
+        };
+
+        if snapshot.is_empty() {
+            return;
+        }
+
+        println!();
+        println!("=== Backend Comparison Summary ===");
+        for operation in [
+            Operation::Apply,
+            Operation::Get,
+            Operation::Patch,
+            Operation::List,
+        ] {
+            if let Some(data) = snapshot.get(&operation) {
+                render(operation, data);
+            }
+        }
+    }
+
+    fn render(operation: Operation, data: &OperationData) {
+        if data.columns.is_empty() || data.rows.is_empty() {
+            return;
+        }
+
+        println!();
+        println!("{} report (median duration per op)", operation.display());
+
+        let mut headers = Vec::with_capacity(data.columns.len() + 1);
+        headers.push("Scenario".to_string());
+        headers.extend(data.columns.iter().cloned());
+
+        let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+        let mut rows = Vec::with_capacity(data.rows.len());
+
+        for (scenario, row_data) in &data.rows {
+            let mut cells = Vec::with_capacity(headers.len());
+            let label = scenario.label();
+            widths[0] = widths[0].max(label.len());
+            cells.push(label);
+
+            for (idx, backend) in data.columns.iter().enumerate() {
+                let cell = row_data
+                    .samples
+                    .get(backend)
+                    .map(|samples| format_duration(median(samples)))
+                    .unwrap_or_else(|| "n/a".to_string());
+                widths[idx + 1] = widths[idx + 1].max(cell.len());
+                cells.push(cell);
+            }
+
+            rows.push(cells);
+        }
+
+        let header_align = vec![false; headers.len()];
+        let mut data_align = vec![true; headers.len()];
+        if let Some(first) = data_align.first_mut() {
+            *first = false;
+        }
+
+        print_separator(&widths);
+        print_row(&headers, &widths, &header_align);
+        print_separator(&widths);
+        for row in rows {
+            print_row(&row, &widths, &data_align);
+        }
+        print_separator(&widths);
+    }
+
+    fn print_separator(widths: &[usize]) {
+        let mut line = String::from("+");
+        for width in widths {
+            line.push_str(&"-".repeat(width + 2));
+            line.push('+');
+        }
+        println!("{}", line);
+    }
+
+    fn print_row(cells: &[String], widths: &[usize], align_right: &[bool]) {
+        let mut line = String::from("|");
+        for ((cell, width), right_align) in cells.iter().zip(widths).zip(align_right) {
+            line.push(' ');
+            if *right_align {
+                line.push_str(&format!("{:>width$}", cell, width = width));
+            } else {
+                line.push_str(&format!("{:<width$}", cell, width = width));
+            }
+            line.push(' ');
+            line.push('|');
+        }
+        println!("{}", line);
+    }
+
+    fn median(samples: &[f64]) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let mid = sorted.len() / 2;
+        if sorted.len() % 2 == 0 {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        }
+    }
+
+    fn format_duration(seconds: f64) -> String {
+        if seconds >= 1.0 {
+            format!("{:.3} s/op", seconds)
+        } else if seconds >= 1e-3 {
+            format!("{:.3} ms/op", seconds * 1e3)
+        } else if seconds >= 1e-6 {
+            format!("{:.3} us/op", seconds * 1e6)
+        } else {
+            format!("{:.3} ns/op", seconds * 1e9)
+        }
+    }
+}
+
 fn criterion_benches() -> Criterion {
     Criterion::default().warm_up_time(std::time::Duration::from_secs(3))
 }
@@ -41,9 +245,21 @@ fn bench_apply(c: &mut Criterion) {
     for (idx, &size) in APPLY_PAYLOAD_SIZES.iter().enumerate() {
         let payload = &payloads[idx];
         group.bench_with_input(BenchmarkId::new("eventdbx", size), payload, |b, payload| {
-            b.iter(|| {
-                let key = eventdbx.apply_new(payload).expect("eventdbx apply");
-                black_box(key.event_id);
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let key = eventdbx.apply_new(payload).expect("eventdbx apply");
+                    black_box(key.event_id);
+                }
+                let elapsed = start.elapsed();
+                report::record(
+                    Operation::Apply,
+                    Scenario::PayloadBytes(size),
+                    "eventdbx",
+                    elapsed,
+                    iters,
+                );
+                elapsed
             });
         });
     }
@@ -57,9 +273,21 @@ fn bench_apply(c: &mut Criterion) {
                     BenchmarkId::new("postgres", size),
                     payload,
                     |b, payload| {
-                        b.iter(|| {
-                            let key = backend.apply_new(payload).expect("postgres apply");
-                            black_box(key.id);
+                        b.iter_custom(|iters| {
+                            let start = Instant::now();
+                            for _ in 0..iters {
+                                let key = backend.apply_new(payload).expect("postgres apply");
+                                black_box(key.id);
+                            }
+                            let elapsed = start.elapsed();
+                            report::record(
+                                Operation::Apply,
+                                Scenario::PayloadBytes(size),
+                                "postgres",
+                                elapsed,
+                                iters,
+                            );
+                            elapsed
                         });
                     },
                 );
@@ -76,33 +304,26 @@ fn bench_apply(c: &mut Criterion) {
             for (idx, &size) in APPLY_PAYLOAD_SIZES.iter().enumerate() {
                 let payload = &payloads[idx];
                 group.bench_with_input(BenchmarkId::new("mongodb", size), payload, |b, payload| {
-                    b.iter(|| {
-                        let key = backend.apply_new(payload).expect("mongodb apply");
-                        black_box(key.id.clone());
+                    b.iter_custom(|iters| {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            let key = backend.apply_new(payload).expect("mongodb apply");
+                            black_box(key.id.clone());
+                        }
+                        let elapsed = start.elapsed();
+                        report::record(
+                            Operation::Apply,
+                            Scenario::PayloadBytes(size),
+                            "mongodb",
+                            elapsed,
+                            iters,
+                        );
+                        elapsed
                     });
                 });
             }
         } else {
             eprintln!("Skipping mongodb apply benchmark: set EVENTDBX_MONGO_URI");
-        }
-    }
-
-    #[cfg(feature = "bench-sqlite")]
-    {
-        if let Some(mut backend) = sqlite::SqliteBackend::from_env().expect("sqlite init") {
-            for (idx, &size) in APPLY_PAYLOAD_SIZES.iter().enumerate() {
-                let payload = &payloads[idx];
-                group.bench_with_input(BenchmarkId::new("sqlite", size), payload, |b, payload| {
-                    b.iter(|| {
-                        let key = backend.apply_new(payload).expect("sqlite apply");
-                        black_box(key.id);
-                    });
-                });
-            }
-        } else {
-            eprintln!(
-                "Skipping sqlite apply benchmark: set EVENTDBX_SQLITE_PATH or allow temp file"
-            );
         }
     }
 
@@ -112,9 +333,21 @@ fn bench_apply(c: &mut Criterion) {
             for (idx, &size) in APPLY_PAYLOAD_SIZES.iter().enumerate() {
                 let payload = &payloads[idx];
                 group.bench_with_input(BenchmarkId::new("mssql", size), payload, |b, payload| {
-                    b.iter(|| {
-                        let key = backend.apply_new(payload).expect("mssql apply");
-                        black_box(key.id);
+                    b.iter_custom(|iters| {
+                        let start = Instant::now();
+                        for _ in 0..iters {
+                            let key = backend.apply_new(payload).expect("mssql apply");
+                            black_box(key.id);
+                        }
+                        let elapsed = start.elapsed();
+                        report::record(
+                            Operation::Apply,
+                            Scenario::PayloadBytes(size),
+                            "mssql",
+                            elapsed,
+                            iters,
+                        );
+                        elapsed
                     });
                 });
             }
@@ -136,10 +369,22 @@ fn bench_get(c: &mut Criterion) {
         .expect("seed eventdbx get dataset");
     let mut eventdbx_cycle = KeyCycle::new(eventdbx_keys);
     group.bench_function("eventdbx", |b| {
-        b.iter(|| {
-            let key = eventdbx_cycle.next();
-            let payload = eventdbx.get(&key).expect("eventdbx get");
-            black_box(payload);
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let key = eventdbx_cycle.next();
+                let payload = eventdbx.get(&key).expect("eventdbx get");
+                black_box(payload);
+            }
+            let elapsed = start.elapsed();
+            report::record(
+                Operation::Get,
+                Scenario::SeedCount(SEED_COUNT),
+                "eventdbx",
+                elapsed,
+                iters,
+            );
+            elapsed
         });
     });
 
@@ -151,10 +396,22 @@ fn bench_get(c: &mut Criterion) {
                 .expect("seed postgres get dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("postgres", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    let payload = backend.get(&key).expect("postgres get");
-                    black_box(payload);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        let payload = backend.get(&key).expect("postgres get");
+                        black_box(payload);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Get,
+                        Scenario::SeedCount(SEED_COUNT),
+                        "postgres",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -169,27 +426,22 @@ fn bench_get(c: &mut Criterion) {
                 .expect("seed mongodb get dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("mongodb", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    let payload = backend.get(&key).expect("mongodb get");
-                    black_box(payload);
-                });
-            });
-        }
-    }
-
-    #[cfg(feature = "bench-sqlite")]
-    {
-        if let Some(mut backend) = sqlite::SqliteBackend::from_env().expect("sqlite init") {
-            let keys = backend
-                .seed(&seed_payload, SEED_COUNT)
-                .expect("seed sqlite get dataset");
-            let mut cycle = KeyCycle::new(keys);
-            group.bench_function("sqlite", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    let payload = backend.get(&key).expect("sqlite get");
-                    black_box(payload);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        let payload = backend.get(&key).expect("mongodb get");
+                        black_box(payload);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Get,
+                        Scenario::SeedCount(SEED_COUNT),
+                        "mongodb",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -203,10 +455,22 @@ fn bench_get(c: &mut Criterion) {
                 .expect("seed mssql get dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("mssql", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    let payload = backend.get(&key).expect("mssql get");
-                    black_box(payload);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        let payload = backend.get(&key).expect("mssql get");
+                        black_box(payload);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Get,
+                        Scenario::SeedCount(SEED_COUNT),
+                        "mssql",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -225,11 +489,23 @@ fn bench_patch(c: &mut Criterion) {
         .expect("seed eventdbx patch dataset");
     let mut eventdbx_cycle = KeyCycle::new(eventdbx_keys);
     group.bench_function("eventdbx", |b| {
-        b.iter(|| {
-            let key = eventdbx_cycle.next();
-            eventdbx
-                .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
-                .expect("eventdbx patch");
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let key = eventdbx_cycle.next();
+                eventdbx
+                    .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
+                    .expect("eventdbx patch");
+            }
+            let elapsed = start.elapsed();
+            report::record(
+                Operation::Patch,
+                Scenario::SeedCount(SEED_COUNT / 2),
+                "eventdbx",
+                elapsed,
+                iters,
+            );
+            elapsed
         });
     });
 
@@ -241,11 +517,23 @@ fn bench_patch(c: &mut Criterion) {
                 .expect("seed postgres patch dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("postgres", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    backend
-                        .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
-                        .expect("postgres patch");
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        backend
+                            .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
+                            .expect("postgres patch");
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Patch,
+                        Scenario::SeedCount(SEED_COUNT / 2),
+                        "postgres",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -260,29 +548,23 @@ fn bench_patch(c: &mut Criterion) {
                 .expect("seed mongodb patch dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("mongodb", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    backend
-                        .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
-                        .expect("mongodb patch");
-                });
-            });
-        }
-    }
-
-    #[cfg(feature = "bench-sqlite")]
-    {
-        if let Some(mut backend) = sqlite::SqliteBackend::from_env().expect("sqlite init") {
-            let keys = backend
-                .seed(&seed_payload, SEED_COUNT / 2)
-                .expect("seed sqlite patch dataset");
-            let mut cycle = KeyCycle::new(keys);
-            group.bench_function("sqlite", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    backend
-                        .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
-                        .expect("sqlite patch");
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        backend
+                            .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
+                            .expect("mongodb patch");
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Patch,
+                        Scenario::SeedCount(SEED_COUNT / 2),
+                        "mongodb",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -296,11 +578,23 @@ fn bench_patch(c: &mut Criterion) {
                 .expect("seed mssql patch dataset");
             let mut cycle = KeyCycle::new(keys);
             group.bench_function("mssql", |b| {
-                b.iter(|| {
-                    let key = cycle.next();
-                    backend
-                        .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
-                        .expect("mssql patch");
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let key = cycle.next();
+                        backend
+                            .patch(&key, &PATCH_TEMPLATE, &PATCH_DOC)
+                            .expect("mssql patch");
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::Patch,
+                        Scenario::SeedCount(SEED_COUNT / 2),
+                        "mssql",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -318,11 +612,26 @@ fn bench_list(c: &mut Criterion) {
         .seed_list_dataset(LIST_AGGREGATE_ID, &seed_payload, LIST_EVENT_COUNT)
         .expect("seed eventdbx list dataset");
     group.bench_function("eventdbx", |b| {
-        b.iter(|| {
-            let events = eventdbx
-                .list(LIST_AGGREGATE_ID, LIST_LIMIT)
-                .expect("eventdbx list");
-            black_box(events);
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let events = eventdbx
+                    .list(LIST_AGGREGATE_ID, LIST_LIMIT)
+                    .expect("eventdbx list");
+                black_box(events);
+            }
+            let elapsed = start.elapsed();
+            report::record(
+                Operation::List,
+                Scenario::ListLimit {
+                    limit: LIST_LIMIT,
+                    events: LIST_EVENT_COUNT,
+                },
+                "eventdbx",
+                elapsed,
+                iters,
+            );
+            elapsed
         });
     });
 
@@ -333,11 +642,26 @@ fn bench_list(c: &mut Criterion) {
                 .seed_list_dataset(LIST_AGGREGATE_ID, &seed_payload, LIST_EVENT_COUNT)
                 .expect("seed postgres list dataset");
             group.bench_function("postgres", |b| {
-                b.iter(|| {
-                    let events = backend
-                        .list(LIST_AGGREGATE_ID, LIST_LIMIT)
-                        .expect("postgres list");
-                    black_box(events);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let events = backend
+                            .list(LIST_AGGREGATE_ID, LIST_LIMIT)
+                            .expect("postgres list");
+                        black_box(events);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::List,
+                        Scenario::ListLimit {
+                            limit: LIST_LIMIT,
+                            events: LIST_EVENT_COUNT,
+                        },
+                        "postgres",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -351,28 +675,26 @@ fn bench_list(c: &mut Criterion) {
                 .seed_list_dataset(LIST_AGGREGATE_ID, &seed_payload, LIST_EVENT_COUNT)
                 .expect("seed mongodb list dataset");
             group.bench_function("mongodb", |b| {
-                b.iter(|| {
-                    let events = backend
-                        .list(LIST_AGGREGATE_ID, LIST_LIMIT)
-                        .expect("mongodb list");
-                    black_box(events);
-                });
-            });
-        }
-    }
-
-    #[cfg(feature = "bench-sqlite")]
-    {
-        if let Some(mut backend) = sqlite::SqliteBackend::from_env().expect("sqlite init") {
-            backend
-                .seed_list_dataset(LIST_AGGREGATE_ID, &seed_payload, LIST_EVENT_COUNT)
-                .expect("seed sqlite list dataset");
-            group.bench_function("sqlite", |b| {
-                b.iter(|| {
-                    let events = backend
-                        .list(LIST_AGGREGATE_ID, LIST_LIMIT)
-                        .expect("sqlite list");
-                    black_box(events);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let events = backend
+                            .list(LIST_AGGREGATE_ID, LIST_LIMIT)
+                            .expect("mongodb list");
+                        black_box(events);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::List,
+                        Scenario::ListLimit {
+                            limit: LIST_LIMIT,
+                            events: LIST_EVENT_COUNT,
+                        },
+                        "mongodb",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
@@ -385,17 +707,33 @@ fn bench_list(c: &mut Criterion) {
                 .seed_list_dataset(LIST_AGGREGATE_ID, &seed_payload, LIST_EVENT_COUNT)
                 .expect("seed mssql list dataset");
             group.bench_function("mssql", |b| {
-                b.iter(|| {
-                    let events = backend
-                        .list(LIST_AGGREGATE_ID, LIST_LIMIT)
-                        .expect("mssql list");
-                    black_box(events);
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let events = backend
+                            .list(LIST_AGGREGATE_ID, LIST_LIMIT)
+                            .expect("mssql list");
+                        black_box(events);
+                    }
+                    let elapsed = start.elapsed();
+                    report::record(
+                        Operation::List,
+                        Scenario::ListLimit {
+                            limit: LIST_LIMIT,
+                            events: LIST_EVENT_COUNT,
+                        },
+                        "mssql",
+                        elapsed,
+                        iters,
+                    );
+                    elapsed
                 });
             });
         }
     }
 
     group.finish();
+    report::print_summary();
 }
 
 criterion_group! {
@@ -449,22 +787,578 @@ struct EventdbxKey {
     event_id: u64,
 }
 
+mod eventdbx_client {
+    use super::*;
+    use anyhow::{Context, Result, anyhow};
+    use capnp::{
+        message::{Builder, ReaderOptions},
+        serialize,
+        serialize::write_message_to_words,
+    };
+    use eventdbx::control_capnp::{
+        control_hello, control_hello_response, control_request, control_response,
+    };
+    use eventdbx::replication_noise::{
+        perform_client_handshake_blocking, read_encrypted_frame_blocking,
+        write_encrypted_frame_blocking,
+    };
+    use eventdbx::store::EventRecord;
+    use serde::Deserialize;
+    use serde_json::Value;
+    use std::{
+        fs,
+        io::{Cursor, ErrorKind, Write},
+        net::TcpStream,
+        path::{Path, PathBuf},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    const CONFIG_WAIT_RETRIES: usize = 360;
+    const CONFIG_WAIT_BACKOFF: Duration = Duration::from_millis(250);
+    const CONNECT_RETRIES: usize = 60;
+    const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
+    const TOKEN_WAIT_RETRIES: usize = 360;
+    const TOKEN_WAIT_BACKOFF: Duration = Duration::from_millis(250);
+
+    #[derive(Deserialize)]
+    struct SocketSection {
+        bind_addr: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ConfigToml {
+        data_dir: PathBuf,
+        socket: SocketSection,
+    }
+
+    impl ConfigToml {
+        fn load(path: &Path) -> Result<Self> {
+            let contents = fs::read_to_string(path)
+                .with_context(|| format!("read EventDBX config at {}", path.display()))?;
+            toml::from_str(&contents)
+                .with_context(|| format!("parse EventDBX config at {}", path.display()))
+        }
+
+        fn base_dir(&self) -> PathBuf {
+            self.data_dir.clone()
+        }
+    }
+
+    pub struct EventdbxClient {
+        connect_addr: String,
+        token: String,
+        fallback_token_path: Option<PathBuf>,
+    }
+
+    impl EventdbxClient {
+        pub fn from_env() -> Result<Self> {
+            let config_path = std::env::var("EVENTDBX_CONFIG_PATH")
+                .unwrap_or_else(|_| "/eventdbx/config.toml".to_string());
+            let config = load_config_with_retry(Path::new(&config_path))
+                .with_context(|| format!("load EventDBX config from {}", config_path))?;
+
+            let connect_addr = std::env::var("EVENTDBX_SOCKET_ADDR")
+                .unwrap_or_else(|_| normalize_connect_addr(&config.socket.bind_addr));
+
+            let cli_token_path = std::env::var("EVENTDBX_CLI_TOKEN_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| config.base_dir().join("cli.token"));
+
+            let (token, fallback_path) = if let Ok(token) = std::env::var("EVENTDBX_TOKEN") {
+                (token, Some(cli_token_path))
+            } else if let Ok(custom_path) = std::env::var("EVENTDBX_TOKEN_PATH") {
+                let path = PathBuf::from(custom_path);
+                (read_token_once(&path)?, Some(path))
+            } else {
+                let path = cli_token_path;
+                (read_token_with_retry(&path)?, Some(path))
+            };
+
+            Ok(Self {
+                connect_addr,
+                token: token.trim().to_string(),
+                fallback_token_path: fallback_path,
+            })
+        }
+
+        pub fn append_event(
+            &mut self,
+            aggregate_type: &str,
+            aggregate_id: &str,
+            event_type: &str,
+            payload: &Value,
+            metadata: Option<&Value>,
+            note: Option<&str>,
+        ) -> Result<EventRecord> {
+            let payload_json =
+                serde_json::to_string(payload).context("serialize payload for append request")?;
+            let (metadata_json, has_metadata) = match metadata {
+                Some(value) => (
+                    serde_json::to_string(value)
+                        .context("serialize metadata for append request")?,
+                    true,
+                ),
+                None => (String::new(), false),
+            };
+            let (note_text, has_note) = match note {
+                Some(value) => (value.to_string(), true),
+                None => (String::new(), false),
+            };
+
+            let connect_addr = self.connect_addr.clone();
+            self.retry_request(|request_id, token| {
+                send_control_request_blocking(
+                    &connect_addr,
+                    token,
+                    request_id,
+                    |request| {
+                        let payload_builder = request.reborrow().init_payload();
+                        let mut append = payload_builder.init_append_event();
+                        append.set_token(token);
+                        append.set_aggregate_type(aggregate_type);
+                        append.set_aggregate_id(aggregate_id);
+                        append.set_event_type(event_type);
+                        append.set_payload_json(&payload_json);
+                        append.set_metadata_json(&metadata_json);
+                        append.set_has_metadata(has_metadata);
+                        append.set_note(&note_text);
+                        append.set_has_note(has_note);
+                        Ok(())
+                    },
+                    |response| {
+                        use control_response::payload;
+
+                        match response
+                            .get_payload()
+                            .which()
+                            .context("decode append response payload")?
+                        {
+                            payload::AppendEvent(Ok(append)) => {
+                                let event_json = read_text(append.get_event_json(), "event_json")?;
+                                if event_json.trim().is_empty() {
+                                    Err(anyhow!("append event response missing payload"))
+                                } else {
+                                    serde_json::from_str(&event_json)
+                                        .context("parse append response event")
+                                }
+                            }
+                            payload::AppendEvent(Err(err)) => Err(anyhow!(
+                                "decode append_event payload from CLI proxy: {}",
+                                err
+                            )),
+                            payload::Error(Ok(error)) => {
+                                let code = read_text(error.get_code(), "code")?;
+                                let message = read_text(error.get_message(), "message")?;
+                                Err(anyhow!("server returned {}: {}", code, message))
+                            }
+                            payload::Error(Err(err)) => {
+                                Err(anyhow!("decode error payload from CLI proxy: {}", err))
+                            }
+                            _ => Err(anyhow!(
+                                "unexpected payload returned from CLI proxy response"
+                            )),
+                        }
+                    },
+                )
+            })
+        }
+
+        pub fn patch_event(
+            &mut self,
+            aggregate_type: &str,
+            aggregate_id: &str,
+            event_type: &str,
+            patch_ops: &Patch,
+            metadata: Option<&Value>,
+            note: Option<&str>,
+        ) -> Result<EventRecord> {
+            let patch_json =
+                serde_json::to_string(patch_ops).context("serialize patch for patch request")?;
+            let (metadata_json, has_metadata) = match metadata {
+                Some(value) => (
+                    serde_json::to_string(value).context("serialize metadata for patch request")?,
+                    true,
+                ),
+                None => (String::new(), false),
+            };
+            let (note_text, has_note) = match note {
+                Some(value) => (value.to_string(), true),
+                None => (String::new(), false),
+            };
+
+            let connect_addr = self.connect_addr.clone();
+            self.retry_request(|request_id, token| {
+                send_control_request_blocking(
+                    &connect_addr,
+                    token,
+                    request_id,
+                    |request| {
+                        let payload_builder = request.reborrow().init_payload();
+                        let mut patch = payload_builder.init_patch_event();
+                        patch.set_token(token);
+                        patch.set_aggregate_type(aggregate_type);
+                        patch.set_aggregate_id(aggregate_id);
+                        patch.set_event_type(event_type);
+                        patch.set_patch_json(&patch_json);
+                        patch.set_metadata_json(&metadata_json);
+                        patch.set_has_metadata(has_metadata);
+                        patch.set_note(&note_text);
+                        patch.set_has_note(has_note);
+                        Ok(())
+                    },
+                    |response| {
+                        use control_response::payload;
+
+                        match response
+                            .get_payload()
+                            .which()
+                            .context("decode patch response payload")?
+                        {
+                            payload::AppendEvent(Ok(append)) => {
+                                let event_json = read_text(append.get_event_json(), "event_json")?;
+                                if event_json.trim().is_empty() {
+                                    Err(anyhow!("patch event response missing payload"))
+                                } else {
+                                    serde_json::from_str(&event_json)
+                                        .context("parse patch response event")
+                                }
+                            }
+                            payload::AppendEvent(Err(err)) => Err(anyhow!(
+                                "decode patch_event payload from CLI proxy: {}",
+                                err
+                            )),
+                            payload::Error(Ok(error)) => {
+                                let code = read_text(error.get_code(), "code")?;
+                                let message = read_text(error.get_message(), "message")?;
+                                Err(anyhow!("server returned {}: {}", code, message))
+                            }
+                            payload::Error(Err(err)) => {
+                                Err(anyhow!("decode error payload from CLI proxy: {}", err))
+                            }
+                            _ => Err(anyhow!(
+                                "unexpected payload returned from CLI proxy response"
+                            )),
+                        }
+                    },
+                )
+            })
+        }
+
+        pub fn list_event_payloads(
+            &mut self,
+            aggregate_type: &str,
+            aggregate_id: &str,
+            limit: usize,
+        ) -> Result<Vec<Value>> {
+            let records =
+                self.list_events_for_aggregate(aggregate_type, aggregate_id, limit as u64, None)?;
+            Ok(records.into_iter().map(|record| record.payload).collect())
+        }
+
+        pub fn get_event(
+            &mut self,
+            aggregate_type: &str,
+            aggregate_id: &str,
+            event_id: u64,
+        ) -> Result<EventRecord> {
+            let filter = format!("event_id = {}", event_id);
+            let records =
+                self.list_events_for_aggregate(aggregate_type, aggregate_id, 1, Some(&filter))?;
+            records
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("event {} not found", event_id))
+        }
+
+        fn list_events_for_aggregate(
+            &mut self,
+            aggregate_type: &str,
+            aggregate_id: &str,
+            take: u64,
+            filter: Option<&str>,
+        ) -> Result<Vec<EventRecord>> {
+            let connect_addr = self.connect_addr.clone();
+            let filter_owned = filter.map(|s| s.to_string());
+            self.retry_request(|request_id, token| {
+                send_control_request_blocking(
+                    &connect_addr,
+                    token,
+                    request_id,
+                    |request| {
+                        let payload_builder = request.reborrow().init_payload();
+                        let mut list = payload_builder.init_list_events();
+                        list.set_token(token);
+                        list.set_aggregate_type(aggregate_type);
+                        list.set_aggregate_id(aggregate_id);
+                        list.set_skip(0);
+                        list.set_take(take);
+                        list.set_has_take(true);
+                        if let Some(filter) = filter_owned.as_deref() {
+                            list.set_filter(filter);
+                            list.set_has_filter(true);
+                        } else {
+                            list.set_has_filter(false);
+                        }
+                        Ok(())
+                    },
+                    |response| {
+                        use control_response::payload;
+
+                        match response
+                            .get_payload()
+                            .which()
+                            .context("decode list events payload")?
+                        {
+                            payload::ListEvents(Ok(events)) => {
+                                let events_json =
+                                    read_text(events.get_events_json(), "events_json")?;
+                                if events_json.trim().is_empty() {
+                                    Ok(Vec::new())
+                                } else {
+                                    serde_json::from_str(&events_json)
+                                        .context("parse list events payload")
+                                }
+                            }
+                            payload::ListEvents(Err(err)) => {
+                                Err(anyhow!("decode listEvents payload from CLI proxy: {}", err))
+                            }
+                            payload::Error(Ok(error)) => {
+                                let code = read_text(error.get_code(), "code")?;
+                                let message = read_text(error.get_message(), "message")?;
+                                Err(anyhow!("server returned {}: {}", code, message))
+                            }
+                            payload::Error(Err(err)) => {
+                                Err(anyhow!("decode error payload from CLI proxy: {}", err))
+                            }
+                            _ => Err(anyhow!(
+                                "unexpected payload returned from CLI proxy response"
+                            )),
+                        }
+                    },
+                )
+            })
+        }
+
+        fn retry_request<F, T>(&mut self, mut op: F) -> Result<T>
+        where
+            F: FnMut(u64, &str) -> Result<T>,
+        {
+            let mut last_err = None;
+            let mut refreshed_token = false;
+            for attempt in 0..CONNECT_RETRIES {
+                let request_id = next_request_id();
+                let token_snapshot = self.token.clone();
+                match op(request_id, &token_snapshot) {
+                    Ok(result) => return Ok(result),
+                    Err(err) => {
+                        if !refreshed_token && self.try_refresh_token(&err)? {
+                            refreshed_token = true;
+                            continue;
+                        }
+                        if attempt + 1 == CONNECT_RETRIES {
+                            return Err(err);
+                        }
+                        last_err = Some(err);
+                        thread::sleep(CONNECT_BACKOFF);
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow!("control request failed without error")))
+        }
+
+        fn try_refresh_token(&mut self, err: &anyhow::Error) -> Result<bool> {
+            if let Some(path) = self.fallback_token_path.clone() {
+                let message = err.to_string();
+                if message.contains("control handshake rejected") {
+                    if let Ok(token) = read_token_once(&path) {
+                        self.token = token.trim().to_string();
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    fn load_config_with_retry(path: &Path) -> Result<ConfigToml> {
+        for attempt in 0..CONFIG_WAIT_RETRIES {
+            match ConfigToml::load(path) {
+                Ok(config) => return Ok(config),
+                Err(err) => {
+                    if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == ErrorKind::NotFound {
+                            if attempt + 1 == CONFIG_WAIT_RETRIES {
+                                return Err(err);
+                            }
+                            thread::sleep(CONFIG_WAIT_BACKOFF);
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        ConfigToml::load(path)
+    }
+
+    fn read_token_with_retry(path: &Path) -> Result<String> {
+        for attempt in 0..TOKEN_WAIT_RETRIES {
+            match read_token_once(path) {
+                Ok(token) => return Ok(token),
+                Err(err) => {
+                    if let Some(io_err) = err.root_cause().downcast_ref::<std::io::Error>() {
+                        if io_err.kind() == ErrorKind::NotFound && attempt + 1 != TOKEN_WAIT_RETRIES
+                        {
+                            thread::sleep(TOKEN_WAIT_BACKOFF);
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        read_token_once(path)
+    }
+
+    fn read_token_once(path: &Path) -> Result<String> {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("read CLI token from {}", path.display()))?;
+        extract_token(&contents).with_context(|| format!("parse CLI token from {}", path.display()))
+    }
+
+    fn extract_token(contents: &str) -> Result<String> {
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("token contents are empty");
+        }
+
+        if let Ok(value) = trimmed.parse::<toml::Value>() {
+            if let Some(token) = value
+                .get("token")
+                .and_then(|entry| entry.as_str())
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                return Ok(token.to_string());
+            }
+        }
+
+        Ok(trimmed.to_string())
+    }
+
+    fn send_control_request_blocking<Build, Handle, T>(
+        connect_addr: &str,
+        handshake_token: &str,
+        request_id: u64,
+        build: Build,
+        handle: Handle,
+    ) -> Result<T>
+    where
+        Build: FnOnce(&mut control_request::Builder<'_>) -> Result<()>,
+        Handle: FnOnce(control_response::Reader<'_>) -> Result<T>,
+    {
+        let mut stream = TcpStream::connect(connect_addr)
+            .with_context(|| format!("connect to CLI proxy at {}", connect_addr))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .context("configure proxy write timeout")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .context("configure proxy read timeout")?;
+
+        let mut hello_message = Builder::new_default();
+        {
+            let mut hello = hello_message.init_root::<control_hello::Builder>();
+            hello.set_protocol_version(1);
+            hello.set_token(handshake_token);
+        }
+        serialize::write_message(&mut stream, &hello_message).context("send control hello")?;
+        stream.flush().context("flush control hello")?;
+
+        let response_message = serialize::read_message(&mut stream, ReaderOptions::new())
+            .context("read hello response")?;
+        let response = response_message
+            .get_root::<control_hello_response::Reader>()
+            .context("decode hello response")?;
+        if !response.get_accepted() {
+            let reason = read_text(response.get_message(), "control handshake message")?;
+            anyhow::bail!("control handshake rejected: {}", reason);
+        }
+
+        let mut noise = perform_client_handshake_blocking(&mut stream, handshake_token.as_bytes())
+            .context("establish encrypted control channel")?;
+
+        let mut message = Builder::new_default();
+        {
+            let mut request = message.init_root::<control_request::Builder>();
+            request.set_id(request_id);
+            build(&mut request)?;
+        }
+        let request_bytes = write_message_to_words(&message);
+        write_encrypted_frame_blocking(&mut stream, &mut noise, &request_bytes)
+            .context("send control request")?;
+
+        let response_bytes = read_encrypted_frame_blocking(&mut stream, &mut noise)?
+            .ok_or_else(|| anyhow!("CLI proxy closed control channel before response"))?;
+        let mut cursor = Cursor::new(&response_bytes);
+        let response_message = serialize::read_message(&mut cursor, ReaderOptions::new())
+            .context("decode control response")?;
+        let response = response_message
+            .get_root::<control_response::Reader>()
+            .context("decode control response")?;
+
+        if response.get_id() != request_id {
+            anyhow::bail!(
+                "CLI proxy returned response id {} but expected {}",
+                response.get_id(),
+                request_id
+            );
+        }
+
+        handle(response)
+    }
+
+    fn read_text(field: capnp::Result<capnp::text::Reader<'_>>, label: &str) -> Result<String> {
+        let reader = field.with_context(|| format!("missing {label} in CLI proxy response"))?;
+        reader
+            .to_str()
+            .map(|value| value.to_string())
+            .map_err(|err| anyhow!("invalid utf-8 in {}: {}", label, err))
+    }
+
+    fn normalize_connect_addr(bind_addr: &str) -> String {
+        use std::net::{IpAddr, SocketAddr};
+
+        if let Ok(addr) = bind_addr.parse::<SocketAddr>() {
+            match addr.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => format!("127.0.0.1:{}", addr.port()),
+                IpAddr::V6(ip) if ip.is_unspecified() => format!("[::1]:{}", addr.port()),
+                _ => addr.to_string(),
+            }
+        } else {
+            bind_addr.to_string()
+        }
+    }
+
+    fn next_request_id() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
 struct EventdbxBackend {
-    store: eventdbx::store::EventStore,
-    _temp_dir: tempfile::TempDir,
+    client: eventdbx_client::EventdbxClient,
     write_counter: u64,
 }
 
 impl EventdbxBackend {
     fn new() -> Result<Self> {
-        use eventdbx::store::EventStore;
-
-        let temp_dir = tempfile::tempdir().context("create temp dir for eventdbx store")?;
-        let store = EventStore::open(temp_dir.path().to_path_buf(), None, 0)?;
-
+        let client = eventdbx_client::EventdbxClient::from_env()?;
         Ok(Self {
-            store,
-            _temp_dir: temp_dir,
+            client,
             write_counter: 0,
         })
     }
@@ -475,23 +1369,19 @@ impl EventdbxBackend {
     }
 
     fn apply_with(
-        &self,
+        &mut self,
         aggregate_id: &str,
         event_type: &str,
         payload: &Value,
     ) -> Result<EventdbxKey> {
-        use eventdbx::store::AppendEvent;
-
-        let record = self.store.append(AppendEvent {
-            aggregate_type: AGGREGATE_TYPE.to_string(),
-            aggregate_id: aggregate_id.to_string(),
-            event_type: event_type.to_string(),
-            payload: payload.clone(),
-            metadata: None,
-            issued_by: None,
-            note: None,
-        })?;
-
+        let record = self.client.append_event(
+            AGGREGATE_TYPE,
+            aggregate_id,
+            event_type,
+            payload,
+            None,
+            None,
+        )?;
         Ok(EventdbxKey {
             aggregate_id: aggregate_id.to_string(),
             event_id: record.metadata.event_id.as_u64(),
@@ -506,31 +1396,28 @@ impl EventdbxBackend {
         Ok(keys)
     }
 
-    fn get(&self, key: &EventdbxKey) -> Result<Value> {
-        use eventdbx::snowflake::SnowflakeId;
-
+    fn get(&mut self, key: &EventdbxKey) -> Result<Value> {
         let record = self
-            .store
-            .find_event_by_id(SnowflakeId::from_u64(key.event_id))?
-            .ok_or_else(|| anyhow!("event {} not found", key.event_id))?;
+            .client
+            .get_event(AGGREGATE_TYPE, &key.aggregate_id, key.event_id)?;
         Ok(record.payload)
     }
 
-    fn patch(&mut self, key: &EventdbxKey, patch_value: &Value, _patch_ops: &Patch) -> Result<()> {
-        let payload = self.store.prepare_payload_from_patch(
+    fn patch(&mut self, key: &EventdbxKey, _patch_value: &Value, patch_ops: &Patch) -> Result<()> {
+        self.client.patch_event(
             AGGREGATE_TYPE,
             &key.aggregate_id,
-            patch_value,
+            EVENT_PATCH_TYPE,
+            patch_ops,
+            None,
+            None,
         )?;
-        let _ = self.apply_with(&key.aggregate_id, EVENT_PATCH_TYPE, &payload)?;
         Ok(())
     }
 
-    fn list(&self, aggregate_id: &str, limit: usize) -> Result<Vec<Value>> {
-        let events =
-            self.store
-                .list_events_paginated(AGGREGATE_TYPE, aggregate_id, 0, Some(limit))?;
-        Ok(events.into_iter().map(|record| record.payload).collect())
+    fn list(&mut self, aggregate_id: &str, limit: usize) -> Result<Vec<Value>> {
+        self.client
+            .list_event_payloads(AGGREGATE_TYPE, aggregate_id, limit)
     }
 
     fn seed_list_dataset(
@@ -555,7 +1442,6 @@ mod postgres {
     #[derive(Clone)]
     pub struct PostgresKey {
         pub id: i64,
-        pub aggregate_id: String,
     }
 
     pub struct PostgresBackend {
@@ -649,10 +1535,7 @@ mod postgres {
                 &self.insert_sql,
                 &[&AGGREGATE_TYPE, &aggregate_id, &event_type, &json_payload],
             ))?;
-            Ok(PostgresKey {
-                id: row.get(0),
-                aggregate_id: aggregate_id.to_string(),
-            })
+            Ok(PostgresKey { id: row.get(0) })
         }
 
         pub fn seed(&mut self, payload: &Value, count: usize) -> Result<Vec<PostgresKey>> {
@@ -726,14 +1609,13 @@ mod mongodb_backend {
     use mongodb::{
         Client, Collection,
         bson::{Bson, Document, doc, to_bson},
-        options::{ClientOptions, FindOptions},
+        options::FindOptions,
     };
     use tokio::runtime::Runtime;
 
     #[derive(Clone)]
     pub struct MongoKey {
         pub id: Bson,
-        pub aggregate_id: String,
     }
 
     pub struct MongoBackend {
@@ -754,10 +1636,9 @@ mod mongodb_backend {
                 std::env::var("EVENTDBX_MONGO_COLLECTION").unwrap_or_else(|_| "events".into());
 
             let runtime = Runtime::new().context("create tokio runtime for mongodb")?;
-            let options = runtime
-                .block_on(ClientOptions::parse(uri))
-                .context("parse mongodb uri")?;
-            let client = Client::with_options(options).context("create mongodb client")?;
+            let client = runtime
+                .block_on(Client::with_uri_str(uri))
+                .context("connect to mongodb")?;
             let collection = client
                 .database(&database)
                 .collection::<Document>(&collection);
@@ -794,13 +1675,8 @@ mod mongodb_backend {
             let result = self
                 .runtime
                 .block_on(self.collection.insert_one(document, None))?;
-            let id = result
-                .inserted_id
-                .ok_or_else(|| anyhow!("mongodb missing inserted id"))?;
-            Ok(MongoKey {
-                id,
-                aggregate_id: aggregate_id.to_string(),
-            })
+            let id = result.inserted_id;
+            Ok(MongoKey { id })
         }
 
         pub fn seed(&mut self, payload: &Value, count: usize) -> Result<Vec<MongoKey>> {
@@ -871,166 +1747,6 @@ mod mongodb_backend {
                     mongodb::bson::from_bson::<Value>(payload.clone())
                         .context("decode mongodb payload")?,
                 );
-            }
-            Ok(values)
-        }
-
-        pub fn seed_list_dataset(
-            &mut self,
-            aggregate_id: &str,
-            payload: &Value,
-            count: usize,
-        ) -> Result<()> {
-            for _ in 0..count {
-                let _ = self.apply_with(aggregate_id, EVENT_APPLY_TYPE, payload)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-#[cfg(feature = "bench-sqlite")]
-mod sqlite {
-    use super::*;
-    use rusqlite::{Connection, params};
-    use tempfile::TempDir;
-
-    #[derive(Clone)]
-    pub struct SqliteKey {
-        pub id: i64,
-        pub aggregate_id: String,
-    }
-
-    pub struct SqliteBackend {
-        conn: Connection,
-        _temp_dir: Option<TempDir>,
-        write_counter: u64,
-    }
-
-    impl SqliteBackend {
-        pub fn from_env() -> Result<Option<Self>> {
-            let (conn, temp_dir) = match std::env::var("EVENTDBX_SQLITE_PATH") {
-                Ok(path) => (
-                    Connection::open(path).context("open sqlite database from path")?,
-                    None,
-                ),
-                Err(_) => {
-                    let temp_dir = TempDir::new().context("create temp dir for sqlite")?;
-                    let path = temp_dir.path().join("bench.db");
-                    (
-                        Connection::open(&path).context("open sqlite temp database")?,
-                        Some(temp_dir),
-                    )
-                }
-            };
-
-            let mut backend = Self {
-                conn,
-                _temp_dir: temp_dir,
-                write_counter: 0,
-            };
-            backend.init_schema()?;
-            Ok(Some(backend))
-        }
-
-        fn init_schema(&mut self) -> Result<()> {
-            self.conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    aggregate_type TEXT NOT NULL,
-                    aggregate_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                DELETE FROM events;",
-            )?;
-            Ok(())
-        }
-
-        pub fn apply_new(&mut self, payload: &Value) -> Result<SqliteKey> {
-            let aggregate_id = super::next_aggregate_id(&mut self.write_counter);
-            self.apply_with(&aggregate_id, EVENT_APPLY_TYPE, payload)
-        }
-
-        fn apply_with(
-            &mut self,
-            aggregate_id: &str,
-            event_type: &str,
-            payload: &Value,
-        ) -> Result<SqliteKey> {
-            self.conn.execute(
-                "INSERT INTO events (aggregate_type, aggregate_id, event_type, payload) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    AGGREGATE_TYPE,
-                    aggregate_id,
-                    event_type,
-                    payload.to_string(),
-                ],
-            )?;
-            Ok(SqliteKey {
-                id: self.conn.last_insert_rowid(),
-                aggregate_id: aggregate_id.to_string(),
-            })
-        }
-
-        pub fn seed(&mut self, payload: &Value, count: usize) -> Result<Vec<SqliteKey>> {
-            let mut keys = Vec::with_capacity(count);
-            for _ in 0..count {
-                keys.push(self.apply_new(payload)?);
-            }
-            Ok(keys)
-        }
-
-        pub fn get(&self, key: &SqliteKey) -> Result<Value> {
-            let payload: String = self.conn.query_row(
-                "SELECT payload FROM events WHERE id = ?1",
-                params![key.id],
-                |row| row.get(0),
-            )?;
-            serde_json::from_str(&payload).context("parse sqlite payload")
-        }
-
-        pub fn patch(
-            &mut self,
-            key: &SqliteKey,
-            _patch_value: &Value,
-            patch_ops: &Patch,
-        ) -> Result<()> {
-            let payload: String = self.conn.query_row(
-                "SELECT payload FROM events WHERE id = ?1",
-                params![key.id],
-                |row| row.get(0),
-            )?;
-            let mut value: Value =
-                serde_json::from_str(&payload).context("parse sqlite payload")?;
-            json_patch::patch(&mut value, patch_ops).context("apply patch to sqlite payload")?;
-            self.conn.execute(
-                "UPDATE events SET payload = ?1 WHERE id = ?2",
-                params![value.to_string(), key.id],
-            )?;
-            Ok(())
-        }
-
-        pub fn list(&self, aggregate_id: &str, limit: usize) -> Result<Vec<Value>> {
-            let mut stmt = self.conn.prepare(
-                "SELECT payload FROM events WHERE aggregate_id = ?1 \
-                 ORDER BY id DESC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![aggregate_id, limit as i64], |row| {
-                let payload: String = row.get(0)?;
-                let value: Value = serde_json::from_str(&payload).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                Ok(value)
-            })?;
-            let mut values = Vec::new();
-            for row in rows {
-                values.push(row?);
             }
             Ok(values)
         }

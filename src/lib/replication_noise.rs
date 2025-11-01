@@ -6,9 +6,16 @@ use sha2::{Digest, Sha256};
 use snow::{TransportState, params::NoiseParams};
 
 const NOISE_PROTOCOL_NAME: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
-const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 const AEAD_TAG_LEN: usize = 16;
 const HANDSHAKE_MESSAGE_MAX: usize = 1024;
+const NOISE_MAX_MESSAGE_LEN: usize = u16::MAX as usize;
+const NOISE_MAX_PAYLOAD_LEN: usize = NOISE_MAX_MESSAGE_LEN - AEAD_TAG_LEN;
+const MAX_ENCRYPTED_CHUNK_LEN: usize = NOISE_MAX_MESSAGE_LEN;
+const CHUNK_HEADER_LEN: usize = 1;
+const MAX_CHUNK_DATA_LEN: usize = NOISE_MAX_PAYLOAD_LEN - CHUNK_HEADER_LEN;
+const CHUNK_FLAG_CONTINUE: u8 = 1;
+const CHUNK_FLAG_DONE: u8 = 0;
 
 fn derive_psk(token: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -104,21 +111,44 @@ pub async fn write_encrypted_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    if plaintext.len() > MAX_FRAME_LEN {
+    if plaintext.len() > MAX_MESSAGE_LEN {
         bail!(
             "plaintext message exceeds maximum Noise frame length ({} bytes)",
-            MAX_FRAME_LEN
+            MAX_MESSAGE_LEN
         );
     }
-    let mut buffer = vec![0u8; plaintext.len() + AEAD_TAG_LEN];
-    let len = state
-        .write_message(plaintext, &mut buffer)
-        .context("failed to encrypt Noise frame")?;
-    send_frame(writer, &buffer[..len]).await?;
-    writer
-        .flush()
-        .await
-        .context("failed to flush encrypted Noise frame")?;
+
+    let mut offset = 0;
+    loop {
+        let remaining = plaintext.len().saturating_sub(offset);
+        let chunk_len = remaining.min(MAX_CHUNK_DATA_LEN);
+        let more = remaining > chunk_len;
+
+        let mut chunk = Vec::with_capacity(CHUNK_HEADER_LEN + chunk_len);
+        chunk.push(if more {
+            CHUNK_FLAG_CONTINUE
+        } else {
+            CHUNK_FLAG_DONE
+        });
+        if chunk_len > 0 {
+            chunk.extend_from_slice(&plaintext[offset..offset + chunk_len]);
+        }
+
+        let mut buffer = vec![0u8; chunk.len() + AEAD_TAG_LEN];
+        let len = state
+            .write_message(&chunk, &mut buffer)
+            .context("failed to encrypt Noise frame")?;
+        send_frame(writer, &buffer[..len]).await?;
+        writer
+            .flush()
+            .await
+            .context("failed to flush encrypted Noise frame")?;
+
+        if !more {
+            break;
+        }
+        offset += chunk_len;
+    }
     Ok(())
 }
 
@@ -129,22 +159,54 @@ pub async fn read_encrypted_frame<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let frame = match read_frame(reader).await? {
-        Some(frame) => frame,
-        None => return Ok(None),
-    };
-    if frame.len() > MAX_FRAME_LEN + AEAD_TAG_LEN {
-        bail!(
-            "encrypted Noise frame exceeds maximum length ({} bytes)",
-            MAX_FRAME_LEN + AEAD_TAG_LEN
-        );
+    let mut message = Vec::new();
+    let mut saw_chunk = false;
+
+    loop {
+        let frame = match read_frame(reader).await? {
+            Some(frame) => frame,
+            None if !saw_chunk => return Ok(None),
+            None => {
+                bail!("peer closed connection while reading encrypted Noise frame");
+            }
+        };
+        if frame.len() > MAX_ENCRYPTED_CHUNK_LEN {
+            bail!(
+                "encrypted Noise frame exceeds maximum length ({} bytes)",
+                MAX_ENCRYPTED_CHUNK_LEN
+            );
+        }
+
+        let mut buffer = vec![0u8; frame.len()];
+        let len = state
+            .read_message(&frame, &mut buffer)
+            .context("failed to decrypt Noise frame")?;
+        buffer.truncate(len);
+
+        if buffer.is_empty() {
+            bail!("decrypted Noise frame missing chunk flag");
+        }
+
+        let (chunk_flag, chunk_payload) = buffer.split_first().expect("checked non-empty chunk");
+        let more = match *chunk_flag {
+            CHUNK_FLAG_DONE => false,
+            CHUNK_FLAG_CONTINUE => true,
+            other => bail!("invalid Noise chunk flag {other}"),
+        };
+
+        if message.len() + chunk_payload.len() > MAX_MESSAGE_LEN {
+            bail!(
+                "decrypted Noise message exceeds maximum length ({} bytes)",
+                MAX_MESSAGE_LEN
+            );
+        }
+        message.extend_from_slice(chunk_payload);
+        saw_chunk = true;
+
+        if !more {
+            return Ok(Some(message));
+        }
     }
-    let mut buffer = vec![0u8; frame.len()];
-    let len = state
-        .read_message(&frame, &mut buffer)
-        .context("failed to decrypt Noise frame")?;
-    buffer.truncate(len);
-    Ok(Some(buffer))
 }
 
 async fn send_frame<W>(writer: &mut W, payload: &[u8]) -> Result<()>
@@ -181,11 +243,11 @@ where
         }
     }
     let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_FRAME_LEN + AEAD_TAG_LEN {
+    if len > MAX_ENCRYPTED_CHUNK_LEN {
         bail!(
             "frame length {} exceeds allowed maximum {}",
             len,
-            MAX_FRAME_LEN + AEAD_TAG_LEN
+            MAX_ENCRYPTED_CHUNK_LEN
         );
     }
     let mut payload = vec![0u8; len];
@@ -235,18 +297,41 @@ pub fn write_encrypted_frame_blocking<W: Write>(
     state: &mut TransportState,
     plaintext: &[u8],
 ) -> Result<()> {
-    if plaintext.len() > MAX_FRAME_LEN {
+    if plaintext.len() > MAX_MESSAGE_LEN {
         bail!(
             "plaintext message exceeds maximum Noise frame length ({} bytes)",
-            MAX_FRAME_LEN
+            MAX_MESSAGE_LEN
         );
     }
-    let mut buffer = vec![0u8; plaintext.len() + AEAD_TAG_LEN];
-    let len = state
-        .write_message(plaintext, &mut buffer)
-        .context("failed to encrypt Noise frame")?;
-    send_frame_blocking(writer, &buffer[..len])?;
-    writer.flush()?;
+
+    let mut offset = 0;
+    loop {
+        let remaining = plaintext.len().saturating_sub(offset);
+        let chunk_len = remaining.min(MAX_CHUNK_DATA_LEN);
+        let more = remaining > chunk_len;
+
+        let mut chunk = Vec::with_capacity(CHUNK_HEADER_LEN + chunk_len);
+        chunk.push(if more {
+            CHUNK_FLAG_CONTINUE
+        } else {
+            CHUNK_FLAG_DONE
+        });
+        if chunk_len > 0 {
+            chunk.extend_from_slice(&plaintext[offset..offset + chunk_len]);
+        }
+
+        let mut buffer = vec![0u8; chunk.len() + AEAD_TAG_LEN];
+        let len = state
+            .write_message(&chunk, &mut buffer)
+            .context("failed to encrypt Noise frame")?;
+        send_frame_blocking(writer, &buffer[..len])?;
+        writer.flush()?;
+
+        if !more {
+            break;
+        }
+        offset += chunk_len;
+    }
     Ok(())
 }
 
@@ -254,22 +339,53 @@ pub fn read_encrypted_frame_blocking<R: Read>(
     reader: &mut R,
     state: &mut TransportState,
 ) -> Result<Option<Vec<u8>>> {
-    let frame = match read_frame_blocking(reader)? {
-        Some(frame) => frame,
-        None => return Ok(None),
-    };
-    if frame.len() > MAX_FRAME_LEN + AEAD_TAG_LEN {
-        bail!(
-            "encrypted Noise frame exceeds maximum length ({} bytes)",
-            MAX_FRAME_LEN + AEAD_TAG_LEN
-        );
+    let mut message = Vec::new();
+    let mut saw_chunk = false;
+
+    loop {
+        let frame = match read_frame_blocking(reader)? {
+            Some(frame) => frame,
+            None if !saw_chunk => return Ok(None),
+            None => {
+                bail!("peer closed connection while reading encrypted Noise frame");
+            }
+        };
+        if frame.len() > MAX_ENCRYPTED_CHUNK_LEN {
+            bail!(
+                "encrypted Noise frame exceeds maximum length ({} bytes)",
+                MAX_ENCRYPTED_CHUNK_LEN
+            );
+        }
+        let mut buffer = vec![0u8; frame.len()];
+        let len = state
+            .read_message(&frame, &mut buffer)
+            .context("failed to decrypt Noise frame")?;
+        buffer.truncate(len);
+
+        if buffer.is_empty() {
+            bail!("decrypted Noise frame missing chunk flag");
+        }
+
+        let (chunk_flag, chunk_payload) = buffer.split_first().expect("checked non-empty chunk");
+        let more = match *chunk_flag {
+            CHUNK_FLAG_DONE => false,
+            CHUNK_FLAG_CONTINUE => true,
+            other => bail!("invalid Noise chunk flag {other}"),
+        };
+
+        if message.len() + chunk_payload.len() > MAX_MESSAGE_LEN {
+            bail!(
+                "decrypted Noise message exceeds maximum length ({} bytes)",
+                MAX_MESSAGE_LEN
+            );
+        }
+        message.extend_from_slice(chunk_payload);
+        saw_chunk = true;
+
+        if !more {
+            return Ok(Some(message));
+        }
     }
-    let mut buffer = vec![0u8; frame.len()];
-    let len = state
-        .read_message(&frame, &mut buffer)
-        .context("failed to decrypt Noise frame")?;
-    buffer.truncate(len);
-    Ok(Some(buffer))
 }
 
 fn send_frame_blocking<W: Write>(writer: &mut W, payload: &[u8]) -> Result<()> {
@@ -298,11 +414,11 @@ fn read_frame_blocking<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         }
     }
     let len = u32::from_be_bytes(header) as usize;
-    if len > MAX_FRAME_LEN + AEAD_TAG_LEN {
+    if len > MAX_ENCRYPTED_CHUNK_LEN {
         bail!(
             "frame length {} exceeds allowed maximum {}",
             len,
-            MAX_FRAME_LEN + AEAD_TAG_LEN
+            MAX_ENCRYPTED_CHUNK_LEN
         );
     }
     let mut payload = vec![0u8; len];
