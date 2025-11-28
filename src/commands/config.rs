@@ -51,6 +51,14 @@ pub struct ConfigArgs {
     #[arg(long = "shard-map-path")]
     pub shard_map_path: Option<PathBuf>,
 
+    /// Default depth for reference resolution
+    #[arg(long = "reference-default-depth")]
+    pub reference_default_depth: Option<usize>,
+
+    /// Maximum depth allowed for reference resolution
+    #[arg(long = "reference-max-depth")]
+    pub reference_max_depth: Option<usize>,
+
     /// Disable Noise encryption for the control channel (Cap'n Proto framing only).
     /// WARNING: Sends control protocol messages in plaintext; use only on trusted networks
     /// such as localhost or private links.
@@ -85,6 +93,8 @@ pub fn execute(config_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
         multi_tenant,
         shard_count,
         shard_map_path,
+        reference_default_depth,
+        reference_max_depth,
         no_noise,
         noise,
     } = args;
@@ -123,6 +133,8 @@ pub fn execute(config_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
         list_page_size,
         page_limit,
         verbose_responses,
+        reference_default_depth,
+        reference_max_depth,
         plugin_max_attempts,
         socket: None,
         snowflake_worker_id,
@@ -176,6 +188,8 @@ fn has_updates(args: &ConfigArgs, config: &Config) -> bool {
         || args.list_page_size.is_some()
         || args.page_limit.is_some()
         || args.verbose_responses.is_some()
+        || args.reference_default_depth.is_some()
+        || args.reference_max_depth.is_some()
         || args.plugin_max_attempts.is_some()
         || args.snapshot_threshold.is_some()
         || args.clear_snapshot_threshold

@@ -117,6 +117,8 @@ impl TenantRegistry {
             quota,
             Some(usage),
             Arc::clone(&self.assignments),
+            self.config.reference_default_depth,
+            self.config.reference_max_depth,
         )))
     }
 
@@ -153,6 +155,8 @@ impl TenantRegistry {
             quota,
             Some(usage),
             Arc::clone(&self.assignments),
+            self.config.reference_default_depth,
+            self.config.reference_max_depth,
         )))
     }
 

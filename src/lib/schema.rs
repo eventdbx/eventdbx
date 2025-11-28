@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use validator::{validate_credit_card, validate_email, validate_url};
 
+use crate::reference::{
+    AggregateReference, ReferenceContext, ReferenceIntegrity, ReferenceOutcome,
+    ReferenceResolutionStatus, ReferenceRules,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum ColumnType {
@@ -150,6 +155,8 @@ pub struct FieldRules {
     pub range: Option<RangeRule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<FieldFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<ReferenceRules>,
     #[serde(skip_serializing_if = "map_is_empty")]
     pub properties: BTreeMap<String, ColumnSettings>,
 }
@@ -163,6 +170,10 @@ impl FieldRules {
             && self.length.is_none()
             && self.range.is_none()
             && self.format.is_none()
+            && self
+                .reference
+                .as_ref()
+                .map_or(true, |rules| rules == &ReferenceRules::default())
             && self.properties.is_empty()
     }
 
@@ -172,6 +183,13 @@ impl FieldRules {
         column_type: &ColumnType,
         value: &ComparableValue,
     ) -> Result<()> {
+        if self.reference.is_some() && self.format != Some(FieldFormat::Reference) {
+            return Err(EventError::SchemaViolation(format!(
+                "field {} specifies reference rules without reference format",
+                path
+            )));
+        }
+
         if !self.contains.is_empty()
             || !self.does_not_contain.is_empty()
             || !self.regex.is_empty()
@@ -304,6 +322,9 @@ impl FieldRules {
                             )));
                         }
                     }
+                    FieldFormat::Reference => {
+                        validate_reference_shape(path, text)?;
+                    }
                 }
             }
         } else if let Some(length) = &self.length {
@@ -358,6 +379,13 @@ impl FieldRules {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LocatedReference {
+    pub path: String,
+    pub reference: AggregateReference,
+    pub integrity: ReferenceIntegrity,
+}
+
 impl<'de> Deserialize<'de> for FieldRules {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -385,6 +413,8 @@ impl<'de> Deserialize<'de> for FieldRules {
             #[serde(default)]
             format: Option<FieldFormat>,
             #[serde(default)]
+            reference: Option<ReferenceRules>,
+            #[serde(default)]
             properties: BTreeMap<String, ColumnSettings>,
         }
 
@@ -397,6 +427,7 @@ impl<'de> Deserialize<'de> for FieldRules {
             length: helper.length,
             range: helper.range,
             format: helper.format,
+            reference: helper.reference,
             properties: helper.properties,
         })
     }
@@ -453,6 +484,7 @@ pub enum FieldFormat {
     KebabCase,
     PascalCase,
     UpperCaseSnakeCase,
+    Reference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -476,6 +508,21 @@ impl ColumnSettings {
         root_value: &Value,
         root_definitions: &BTreeMap<String, ColumnSettings>,
     ) -> Result<()> {
+        if self.rules.format == Some(FieldFormat::Reference)
+            && !matches!(self.column_type, ColumnType::Text)
+        {
+            return Err(EventError::SchemaViolation(format!(
+                "field {} uses reference format but must be a text column",
+                path
+            )));
+        }
+        if self.rules.reference.is_some() && self.rules.format != Some(FieldFormat::Reference) {
+            return Err(EventError::SchemaViolation(format!(
+                "field {} specifies reference rules without reference format",
+                path
+            )));
+        }
+
         if value_opt.is_none() {
             if self.rules.required {
                 return Err(EventError::SchemaViolation(format!(
@@ -1040,6 +1087,60 @@ impl SchemaManager {
         Ok(())
     }
 
+    pub fn normalize_references<F>(
+        &self,
+        aggregate: &str,
+        payload: Value,
+        context: ReferenceContext<'_>,
+        mut resolver: F,
+    ) -> Result<(Value, Vec<ReferenceOutcome>)>
+    where
+        F: FnMut(&AggregateReference, ReferenceIntegrity) -> Result<ReferenceResolutionStatus>,
+    {
+        let schema = match self.items.read().get(aggregate) {
+            Some(schema) => schema.clone(),
+            None => return Ok((payload, Vec::new())),
+        };
+
+        let mut normalized = payload;
+        let mut outcomes = Vec::new();
+        if let Value::Object(ref mut map) = normalized {
+            normalize_reference_columns(
+                &schema.column_types,
+                map,
+                context,
+                &mut resolver,
+                &mut outcomes,
+                "",
+            )?;
+        }
+
+        Ok((normalized, outcomes))
+    }
+
+    pub fn collect_references(
+        &self,
+        aggregate: &str,
+        state: &BTreeMap<String, String>,
+        context: ReferenceContext<'_>,
+    ) -> Result<Vec<LocatedReference>> {
+        let items = self.items.read();
+        let Some(schema) = items.get(aggregate) else {
+            return Ok(Vec::new());
+        };
+
+        let mut references = Vec::new();
+        collect_reference_columns(&schema.column_types, state, context, &mut references, "")?;
+        Ok(references)
+    }
+
+    pub fn reference_rules_for_path(&self, aggregate: &str, path: &str) -> Option<ReferenceRules> {
+        let items = self.items.read();
+        let schema = items.get(aggregate)?;
+        let segments: Vec<&str> = path.split('.').collect();
+        reference_rules_for_segments(&schema.column_types, &segments)
+    }
+
     pub fn remove_event(&self, aggregate: &str, event: &str) -> Result<AggregateSchema> {
         let mut items = self.items.write();
         let result = {
@@ -1086,6 +1187,271 @@ fn validate_columns(
         let path = join_path(prefix, field);
         let value_opt = payload.get(field);
         definition.validate_with_path(&path, value_opt, root_value, root_definitions)?;
+    }
+    Ok(())
+}
+
+fn normalize_reference_columns<F>(
+    definitions: &BTreeMap<String, ColumnSettings>,
+    payload: &mut JsonMap<String, Value>,
+    context: ReferenceContext<'_>,
+    resolver: &mut F,
+    outcomes: &mut Vec<ReferenceOutcome>,
+    prefix: &str,
+) -> Result<()>
+where
+    F: FnMut(&AggregateReference, ReferenceIntegrity) -> Result<ReferenceResolutionStatus>,
+{
+    for (field, definition) in definitions {
+        let path = join_path(prefix, field);
+        let Some(value) = payload.get_mut(field) else {
+            continue;
+        };
+        normalize_reference_value(value, definition, context, resolver, outcomes, &path)?;
+    }
+    Ok(())
+}
+
+fn collect_reference_columns(
+    definitions: &BTreeMap<String, ColumnSettings>,
+    state: &BTreeMap<String, String>,
+    context: ReferenceContext<'_>,
+    output: &mut Vec<LocatedReference>,
+    prefix: &str,
+) -> Result<()> {
+    for (field, definition) in definitions {
+        let path = join_path(prefix, field);
+        let value = state.get(field);
+        collect_reference_field(definition, value, context, output, &path)?;
+    }
+    Ok(())
+}
+
+fn collect_reference_field(
+    settings: &ColumnSettings,
+    value: Option<&String>,
+    context: ReferenceContext<'_>,
+    output: &mut Vec<LocatedReference>,
+    path: &str,
+) -> Result<()> {
+    match settings.column_type {
+        ColumnType::Object => {
+            if settings.rules.properties.is_empty() {
+                return Ok(());
+            }
+            let Some(raw) = value else {
+                return Ok(());
+            };
+            let parsed: Value = serde_json::from_str(raw).map_err(|err| {
+                EventError::SchemaViolation(format!(
+                    "field {} must be valid JSON object: {}",
+                    path, err
+                ))
+            })?;
+            let Value::Object(map) = parsed else {
+                return Ok(());
+            };
+            collect_reference_object(&settings.rules.properties, &map, context, output, path)
+        }
+        _ => {
+            if settings.rules.format != Some(FieldFormat::Reference) {
+                return Ok(());
+            }
+            let Some(raw) = value else {
+                return Ok(());
+            };
+            if raw.trim().is_empty() {
+                return Ok(());
+            }
+            let reference = AggregateReference::parse(raw, context)?;
+            let integrity = settings
+                .rules
+                .reference
+                .as_ref()
+                .map(|rules| rules.integrity)
+                .unwrap_or_default();
+            output.push(LocatedReference {
+                path: path.to_string(),
+                reference,
+                integrity,
+            });
+            Ok(())
+        }
+    }
+}
+
+fn collect_reference_object(
+    definitions: &BTreeMap<String, ColumnSettings>,
+    payload: &JsonMap<String, Value>,
+    context: ReferenceContext<'_>,
+    output: &mut Vec<LocatedReference>,
+    prefix: &str,
+) -> Result<()> {
+    for (field, definition) in definitions {
+        let path = join_path(prefix, field);
+        let Some(value) = payload.get(field) else {
+            continue;
+        };
+        match definition.column_type {
+            ColumnType::Object => {
+                if definition.rules.properties.is_empty() {
+                    continue;
+                }
+                if let Value::Object(map) = value {
+                    collect_reference_object(
+                        &definition.rules.properties,
+                        map,
+                        context,
+                        output,
+                        &path,
+                    )?;
+                }
+            }
+            _ => {
+                if definition.rules.format != Some(FieldFormat::Reference) {
+                    continue;
+                }
+                let Some(text) = value.as_str() else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                let reference = AggregateReference::parse(text, context)?;
+                let integrity = definition
+                    .rules
+                    .reference
+                    .as_ref()
+                    .map(|rules| rules.integrity)
+                    .unwrap_or_default();
+                output.push(LocatedReference {
+                    path: path.to_string(),
+                    reference,
+                    integrity,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reference_rules_for_segments(
+    definitions: &BTreeMap<String, ColumnSettings>,
+    segments: &[&str],
+) -> Option<ReferenceRules> {
+    let (first, rest) = segments.split_first()?;
+    let settings = definitions.get(*first)?;
+    if rest.is_empty() {
+        return settings.rules.reference.clone();
+    }
+
+    match settings.column_type {
+        ColumnType::Object => reference_rules_for_segments(&settings.rules.properties, rest),
+        _ => None,
+    }
+}
+
+fn normalize_reference_value<F>(
+    value: &mut Value,
+    settings: &ColumnSettings,
+    context: ReferenceContext<'_>,
+    resolver: &mut F,
+    outcomes: &mut Vec<ReferenceOutcome>,
+    path: &str,
+) -> Result<()>
+where
+    F: FnMut(&AggregateReference, ReferenceIntegrity) -> Result<ReferenceResolutionStatus>,
+{
+    match settings.column_type {
+        ColumnType::Object => {
+            let object = value.as_object_mut().ok_or_else(|| {
+                EventError::SchemaViolation(format!("field {} must be a JSON object", path))
+            })?;
+            normalize_reference_columns(
+                &settings.rules.properties,
+                object,
+                context,
+                resolver,
+                outcomes,
+                path,
+            )?;
+        }
+        _ => {
+            if settings.rules.format != Some(FieldFormat::Reference) || value.is_null() {
+                return Ok(());
+            }
+            let text = value.as_str().ok_or_else(|| {
+                EventError::SchemaViolation(format!(
+                    "field {} must be a string to store a reference",
+                    path
+                ))
+            })?;
+            let reference = AggregateReference::parse(text, context)?;
+            let integrity = settings
+                .rules
+                .reference
+                .as_ref()
+                .map(|rules| rules.integrity)
+                .unwrap_or_default();
+            if let Some(expected_tenant) = settings
+                .rules
+                .reference
+                .as_ref()
+                .and_then(|rules| rules.tenant.as_ref())
+            {
+                if !reference.domain.eq_ignore_ascii_case(expected_tenant) {
+                    return Err(EventError::SchemaViolation(format!(
+                        "reference {} must target tenant/domain {}",
+                        path, expected_tenant
+                    )));
+                }
+            }
+            if let Some(expected_aggregate) = settings
+                .rules
+                .reference
+                .as_ref()
+                .and_then(|rules| rules.aggregate_type.as_ref())
+            {
+                if reference.aggregate_type != *expected_aggregate {
+                    return Err(EventError::SchemaViolation(format!(
+                        "reference {} must target aggregate type {}",
+                        path, expected_aggregate
+                    )));
+                }
+            }
+            let status = resolver(&reference, integrity)?;
+
+            if integrity == ReferenceIntegrity::Strong {
+                match status {
+                    ReferenceResolutionStatus::Ok => {}
+                    ReferenceResolutionStatus::NotFound => {
+                        return Err(EventError::SchemaViolation(format!(
+                            "reference {} points to missing aggregate {}",
+                            path, reference
+                        )));
+                    }
+                    ReferenceResolutionStatus::Forbidden => {
+                        return Err(EventError::SchemaViolation(format!(
+                            "reference {} points to an aggregate the caller cannot access ({})",
+                            path, reference
+                        )));
+                    }
+                    ReferenceResolutionStatus::Cycle | ReferenceResolutionStatus::DepthExceeded => {
+                        return Err(EventError::SchemaViolation(format!(
+                            "reference {} could not be validated (status: {:?})",
+                            path, status
+                        )));
+                    }
+                }
+            }
+
+            *value = Value::String(reference.to_canonical());
+            outcomes.push(ReferenceOutcome {
+                path: path.to_string(),
+                reference,
+                status,
+            });
+        }
     }
     Ok(())
 }
@@ -1437,6 +1803,36 @@ fn parse_date_literal(raw: &str, path: &str) -> Result<NaiveDate> {
     })
 }
 
+fn validate_reference_shape(path: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(EventError::SchemaViolation(format!(
+            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            path
+        )));
+    }
+    if !trimmed.contains('#') {
+        return Err(EventError::SchemaViolation(format!(
+            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            path
+        )));
+    }
+    let parts: Vec<_> = trimmed.split('#').collect();
+    if !(parts.len() == 2 || parts.len() == 3) {
+        return Err(EventError::SchemaViolation(format!(
+            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            path
+        )));
+    }
+    if parts.last().map(|part| part.is_empty()).unwrap_or(true) {
+        return Err(EventError::SchemaViolation(format!(
+            "field {} must specify an aggregate id after '#'",
+            path
+        )));
+    }
+    Ok(())
+}
+
 fn validate_country_code(value: &str) -> bool {
     if value.len() != 2 {
         return false;
@@ -1708,6 +2104,235 @@ mod tests {
         let payload = json!({});
         let err = manager
             .validate_event("person", "person_created", &payload)
+            .unwrap_err();
+        assert!(matches!(err, EventError::SchemaViolation(_)));
+    }
+
+    #[test]
+    fn reference_format_allows_shorthand_shapes() {
+        let mut rules = FieldRules::default();
+        rules.format = Some(FieldFormat::Reference);
+
+        for value in ["#123", "domain#agg#id-1", "agg#123"] {
+            rules
+                .validate_rules(
+                    "ref",
+                    &ColumnType::Text,
+                    &ComparableValue::Text(value.to_string()),
+                )
+                .expect("reference shape should be accepted");
+        }
+
+        for value in ["missing-delimiter", "too#many#parts#here", "agg#"] {
+            let err = rules
+                .validate_rules(
+                    "ref",
+                    &ColumnType::Text,
+                    &ComparableValue::Text(value.to_string()),
+                )
+                .unwrap_err();
+            assert!(matches!(err, EventError::SchemaViolation(_)), "{value}");
+        }
+    }
+
+    #[test]
+    fn normalize_references_canonicalizes_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        let manager = SchemaManager::load(path).unwrap();
+
+        manager
+            .create(CreateSchemaInput {
+                aggregate: "farm".into(),
+                events: vec!["created".into()],
+                snapshot_threshold: None,
+            })
+            .unwrap();
+
+        let mut type_update = SchemaUpdate::default();
+        type_update.column_type = Some(("address".into(), Some(ColumnType::Text)));
+        manager.update("farm", type_update).unwrap();
+
+        let mut rules = FieldRules::default();
+        rules.format = Some(FieldFormat::Reference);
+        rules.reference = Some(ReferenceRules::default());
+
+        let mut rules_update = SchemaUpdate::default();
+        rules_update.column_rules = Some(("address".into(), Some(rules)));
+        manager.update("farm", rules_update).unwrap();
+
+        let payload = json!({ "address": "#123" });
+        let (normalized, outcomes) = manager
+            .normalize_references(
+                "farm",
+                payload,
+                ReferenceContext {
+                    domain: "farm",
+                    aggregate_type: "farm",
+                },
+                |reference, _| {
+                    assert_eq!(reference.to_string(), "farm#farm#123");
+                    Ok(ReferenceResolutionStatus::Ok)
+                },
+            )
+            .expect("normalization should succeed");
+
+        let address = normalized
+            .as_object()
+            .and_then(|map| map.get("address"))
+            .and_then(Value::as_str);
+        assert_eq!(address, Some("farm#farm#123"));
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, ReferenceResolutionStatus::Ok);
+    }
+
+    #[test]
+    fn normalize_references_enforces_strong_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        let manager = SchemaManager::load(path).unwrap();
+
+        manager
+            .create(CreateSchemaInput {
+                aggregate: "farm".into(),
+                events: vec!["created".into()],
+                snapshot_threshold: None,
+            })
+            .unwrap();
+
+        let mut type_update = SchemaUpdate::default();
+        type_update.column_type = Some(("address".into(), Some(ColumnType::Text)));
+        manager.update("farm", type_update).unwrap();
+
+        let mut rules = FieldRules::default();
+        rules.format = Some(FieldFormat::Reference);
+        rules.reference = Some(ReferenceRules::default());
+
+        let mut rules_update = SchemaUpdate::default();
+        rules_update.column_rules = Some(("address".into(), Some(rules)));
+        manager.update("farm", rules_update).unwrap();
+
+        let payload = json!({ "address": "address#missing" });
+        let err = manager
+            .normalize_references(
+                "farm",
+                payload,
+                ReferenceContext {
+                    domain: "farm",
+                    aggregate_type: "farm",
+                },
+                |_reference, _| Ok(ReferenceResolutionStatus::NotFound),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EventError::SchemaViolation(_)));
+    }
+
+    #[test]
+    fn normalize_references_allows_weak_integrity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        let manager = SchemaManager::load(path).unwrap();
+
+        manager
+            .create(CreateSchemaInput {
+                aggregate: "farm".into(),
+                events: vec!["created".into()],
+                snapshot_threshold: None,
+            })
+            .unwrap();
+
+        let mut type_update = SchemaUpdate::default();
+        type_update.column_type = Some(("address".into(), Some(ColumnType::Text)));
+        manager.update("farm", type_update).unwrap();
+
+        let mut rules = FieldRules::default();
+        rules.format = Some(FieldFormat::Reference);
+        rules.reference = Some(ReferenceRules {
+            integrity: ReferenceIntegrity::Weak,
+            ..ReferenceRules::default()
+        });
+
+        let mut rules_update = SchemaUpdate::default();
+        rules_update.column_rules = Some(("address".into(), Some(rules)));
+        manager.update("farm", rules_update).unwrap();
+
+        let payload = json!({ "address": "address#missing" });
+        let (normalized, outcomes) = manager
+            .normalize_references(
+                "farm",
+                payload,
+                ReferenceContext {
+                    domain: "farm",
+                    aggregate_type: "farm",
+                },
+                |_reference, _| Ok(ReferenceResolutionStatus::NotFound),
+            )
+            .expect("weak reference should not fail validation");
+
+        let address = normalized
+            .as_object()
+            .and_then(|map| map.get("address"))
+            .and_then(Value::as_str);
+        assert_eq!(address, Some("farm#address#missing"));
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, ReferenceResolutionStatus::NotFound);
+    }
+
+    #[test]
+    fn normalize_references_enforces_tenant_and_aggregate_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        let manager = SchemaManager::load(path).unwrap();
+
+        manager
+            .create(CreateSchemaInput {
+                aggregate: "farm".into(),
+                events: vec!["created".into()],
+                snapshot_threshold: None,
+            })
+            .unwrap();
+
+        let mut type_update = SchemaUpdate::default();
+        type_update.column_type = Some(("address".into(), Some(ColumnType::Text)));
+        manager.update("farm", type_update).unwrap();
+
+        let mut rules = FieldRules::default();
+        rules.format = Some(FieldFormat::Reference);
+        rules.reference = Some(ReferenceRules {
+            tenant: Some("geo".into()),
+            aggregate_type: Some("address".into()),
+            ..ReferenceRules::default()
+        });
+
+        let mut rules_update = SchemaUpdate::default();
+        rules_update.column_rules = Some(("address".into(), Some(rules)));
+        manager.update("farm", rules_update).unwrap();
+
+        let payload = json!({ "address": "geo#address#123" });
+        manager
+            .normalize_references(
+                "farm",
+                payload,
+                ReferenceContext {
+                    domain: "farm",
+                    aggregate_type: "farm",
+                },
+                |_reference, _| Ok(ReferenceResolutionStatus::Ok),
+            )
+            .expect("matching tenant/aggregate should pass");
+
+        let payload = json!({ "address": "farm#address#123" });
+        let err = manager
+            .normalize_references(
+                "farm",
+                payload,
+                ReferenceContext {
+                    domain: "farm",
+                    aggregate_type: "farm",
+                },
+                |_reference, _| Ok(ReferenceResolutionStatus::Ok),
+            )
             .unwrap_err();
         assert!(matches!(err, EventError::SchemaViolation(_)));
     }

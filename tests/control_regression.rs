@@ -131,6 +131,8 @@ async fn control_capnp_regression_flows() -> Result<()> {
         None,
         Some(usage),
         Arc::clone(&assignments),
+        config.reference_default_depth,
+        config.reference_max_depth,
     );
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let core_provider: Arc<dyn CoreProvider> = Arc::new(StaticCoreProvider::new(core.clone()));
@@ -750,6 +752,8 @@ async fn control_capnp_patch_requires_existing() -> Result<()> {
         None,
         Some(usage),
         Arc::clone(&assignments),
+        config.reference_default_depth,
+        config.reference_max_depth,
     );
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let core_provider: Arc<dyn CoreProvider> = Arc::new(StaticCoreProvider::new(core.clone()));
@@ -1444,6 +1448,8 @@ async fn control_tenant_admin_commands() -> Result<()> {
         None,
         Some(usage),
         Arc::clone(&assignments),
+        config.reference_default_depth,
+        config.reference_max_depth,
     );
     let shared_config = Arc::new(RwLock::new(config.clone()));
     let core_provider: Arc<dyn CoreProvider> = Arc::new(StaticCoreProvider::new(core.clone()));

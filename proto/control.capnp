@@ -26,6 +26,7 @@ struct ControlRequest {
     createSnapshot @19 :CreateSnapshotRequest;
     listSnapshots @20 :ListSnapshotsRequest;
     getSnapshot @21 :GetSnapshotRequest;
+    listReferrers @22 :ListReferrersRequest;
   }
 }
 
@@ -53,6 +54,7 @@ struct ControlResponse {
     createSnapshot @19 :CreateSnapshotResponse;
     listSnapshots @20 :ListSnapshotsResponse;
     getSnapshot @21 :GetSnapshotResponse;
+    listReferrers @22 :ListReferrersResponse;
   }
 }
 
@@ -81,23 +83,43 @@ struct ListAggregatesRequest {
   includeArchived @8 :Bool;
   archivedOnly @9 :Bool;
   token @10 :Text;
+  resolve @11 :Bool;
+  resolveDepth @12 :UInt32;
+  hasResolveDepth @13 :Bool;
 }
 
 struct ListAggregatesResponse {
   aggregatesJson @0 :Text;
   nextCursor @1 :Text;
   hasNextCursor @2 :Bool;
+  resolvedJson @3 :Text;
+  hasResolvedJson @4 :Bool;
 }
 
 struct GetAggregateRequest {
   aggregateType @0 :Text;
   aggregateId @1 :Text;
   token @2 :Text;
+  resolve @3 :Bool;
+  resolveDepth @4 :UInt32;
+  hasResolveDepth @5 :Bool;
 }
 
 struct GetAggregateResponse {
   found @0 :Bool;
   aggregateJson @1 :Text;
+  resolvedJson @2 :Text;
+  hasResolvedJson @3 :Bool;
+}
+
+struct ListReferrersRequest {
+  token @0 :Text;
+  aggregateType @1 :Text;
+  aggregateId @2 :Text;
+}
+
+struct ListReferrersResponse {
+  referrersJson @0 :Text;
 }
 
 struct ListEventsRequest {

@@ -378,6 +378,8 @@ fn apply_start_overrides(config: &mut Config, args: &StartArgs) {
         list_page_size: None,
         page_limit: None,
         verbose_responses: None,
+        reference_default_depth: None,
+        reference_max_depth: None,
         plugin_max_attempts: None,
         socket: None,
         tenants: None,

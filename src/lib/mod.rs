@@ -10,6 +10,7 @@ pub mod merkle;
 pub mod observability;
 pub mod plugin;
 pub mod plugin_capnp;
+pub mod reference;
 pub mod replication_noise;
 pub mod restrict;
 pub mod schema;

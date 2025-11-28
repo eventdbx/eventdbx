@@ -10,6 +10,7 @@ use crate::commands::schema_version::{
 };
 use eventdbx::{
     config::load_or_default,
+    reference::{ReferenceCascade, ReferenceIntegrity, ReferenceRules},
     schema::{
         ColumnType, CreateSchemaInput, FieldFormat, FieldRules, MAX_EVENT_NOTE_LENGTH,
         SchemaManager, SchemaUpdate,
@@ -129,6 +130,10 @@ pub struct SchemaHideArgs {
     /// Field/property name to hide
     #[arg(long)]
     pub field: String,
+
+    /// Show the field again (removes it from the hidden list)
+    #[arg(long, default_value_t = false)]
+    pub show: bool,
 }
 
 #[derive(Args)]
@@ -141,7 +146,7 @@ pub struct SchemaFieldArgs {
     #[arg(value_name = "FIELD")]
     pub field: String,
 
-    /// Column data type to enforce
+    /// Column data type to enforce (use 'reference' for ref fields)
     #[arg(long = "type", value_name = "TYPE", conflicts_with = "clear_type")]
     pub column_type: Option<String>,
 
@@ -252,6 +257,30 @@ pub struct SchemaFieldArgs {
     /// Clear nested object property rules
     #[arg(long = "clear-properties", default_value_t = false)]
     pub clear_properties: bool,
+
+    /// Reference integrity (strong or weak)
+    #[arg(long = "reference-integrity", value_enum)]
+    pub reference_integrity: Option<ReferenceIntegrityArg>,
+
+    /// Reference tenant/domain to enforce (only valid for reference fields)
+    #[arg(long = "reference-tenant", value_name = "TENANT")]
+    pub reference_tenant: Option<String>,
+
+    /// Reference aggregate type to enforce (only valid for reference fields)
+    #[arg(long = "reference-aggregate", value_name = "AGGREGATE")]
+    pub reference_aggregate: Option<String>,
+
+    /// Reference delete policy (none, restrict, nullify)
+    #[arg(long = "reference-cascade", value_enum)]
+    pub reference_cascade: Option<ReferenceCascadeArg>,
+
+    /// Lock the field to prevent future updates
+    #[arg(long = "lock", default_value_t = false, conflicts_with = "unlock")]
+    pub lock: bool,
+
+    /// Unlock the field to allow updates again
+    #[arg(long = "unlock", default_value_t = false)]
+    pub unlock: bool,
 }
 
 impl SchemaFieldArgs {
@@ -278,6 +307,10 @@ impl SchemaFieldArgs {
             || self.clear_range
             || self.properties.is_some()
             || self.clear_properties
+            || self.reference_integrity.is_some()
+            || self.reference_tenant.is_some()
+            || self.reference_aggregate.is_some()
+            || self.reference_cascade.is_some()
     }
 
     fn has_any_changes(&self) -> bool {
@@ -285,9 +318,11 @@ impl SchemaFieldArgs {
             || self.rules.is_some()
             || self.clear_rules
             || self.has_rule_flag_updates()
+            || self.lock
+            || self.unlock
     }
 
-    fn apply_rule_overrides(&self, rules: &mut FieldRules) -> Result<()> {
+    fn apply_rule_overrides(&self, rules: &mut FieldRules, is_reference_field: bool) -> Result<()> {
         if self.required {
             rules.required = true;
         }
@@ -343,11 +378,46 @@ impl SchemaFieldArgs {
         } else if let Some(json) = &self.properties {
             rules.properties = parse_json_input(json, "properties")?;
         }
+
+        let reference_flags_present = self.reference_integrity.is_some()
+            || self.reference_tenant.is_some()
+            || self.reference_aggregate.is_some()
+            || self.reference_cascade.is_some();
+
+        if reference_flags_present {
+            if rules.format != Some(FieldFormat::Reference) && !is_reference_field {
+                return Err(anyhow!(
+                    "reference flags require a reference field; set --type reference or --format reference"
+                ));
+            }
+            rules.format = Some(FieldFormat::Reference);
+            let mut ref_rules = rules.reference.clone().unwrap_or_default();
+            if let Some(value) = self.reference_integrity {
+                ref_rules.integrity = value.into();
+            }
+            if let Some(value) = &self.reference_tenant {
+                ref_rules.tenant = Some(value.trim().to_string());
+            }
+            if let Some(value) = &self.reference_aggregate {
+                ref_rules.aggregate_type = Some(value.trim().to_string());
+            }
+            if let Some(value) = self.reference_cascade {
+                ref_rules.cascade = value.into();
+            }
+            rules.reference = Some(ref_rules);
+        }
         Ok(())
     }
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+fn is_reference_type_alias(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "ref" | "reference" | "aggregate_ref" | "aggregate-reference"
+    )
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum FieldFormatArg {
     #[value(name = "email")]
     Email,
@@ -371,6 +441,8 @@ pub enum FieldFormatArg {
     PascalCase,
     #[value(name = "upper_case_snake_case")]
     UpperCaseSnakeCase,
+    #[value(name = "reference")]
+    Reference,
 }
 
 impl From<FieldFormatArg> for FieldFormat {
@@ -387,6 +459,44 @@ impl From<FieldFormatArg> for FieldFormat {
             FieldFormatArg::KebabCase => FieldFormat::KebabCase,
             FieldFormatArg::PascalCase => FieldFormat::PascalCase,
             FieldFormatArg::UpperCaseSnakeCase => FieldFormat::UpperCaseSnakeCase,
+            FieldFormatArg::Reference => FieldFormat::Reference,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ReferenceIntegrityArg {
+    #[value(name = "strong")]
+    Strong,
+    #[value(name = "weak")]
+    Weak,
+}
+
+impl From<ReferenceIntegrityArg> for ReferenceIntegrity {
+    fn from(value: ReferenceIntegrityArg) -> Self {
+        match value {
+            ReferenceIntegrityArg::Strong => ReferenceIntegrity::Strong,
+            ReferenceIntegrityArg::Weak => ReferenceIntegrity::Weak,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ReferenceCascadeArg {
+    #[value(name = "none")]
+    None,
+    #[value(name = "restrict")]
+    Restrict,
+    #[value(name = "nullify")]
+    Nullify,
+}
+
+impl From<ReferenceCascadeArg> for ReferenceCascade {
+    fn from(value: ReferenceCascadeArg) -> Self {
+        match value {
+            ReferenceCascadeArg::None => ReferenceCascade::None,
+            ReferenceCascadeArg::Restrict => ReferenceCascade::Restrict,
+            ReferenceCascadeArg::Nullify => ReferenceCascade::Nullify,
         }
     }
 }
@@ -654,10 +764,14 @@ fn hide_field(config_path: Option<PathBuf>, args: SchemaHideArgs) -> Result<()> 
     }
 
     let mut update = SchemaUpdate::default();
-    update.hidden_field = Some((field.to_string(), true));
+    update.hidden_field = Some((field.to_string(), !args.show));
     manager.update(aggregate, update)?;
 
-    println!("aggregate={} field={} hidden", aggregate, field);
+    if args.show {
+        println!("aggregate={} field={} shown", aggregate, field);
+    } else {
+        println!("aggregate={} field={} hidden", aggregate, field);
+    }
     Ok(())
 }
 
@@ -678,6 +792,14 @@ fn schema_field(config_path: Option<PathBuf>, args: SchemaFieldArgs) -> Result<(
         ));
     }
 
+    let reference_alias = args
+        .column_type
+        .as_deref()
+        .map(is_reference_type_alias)
+        .unwrap_or(false);
+    let has_explicit_rule_change =
+        args.rules.is_some() || args.clear_rules || args.has_rule_flag_updates();
+
     if args.clear_type && (args.rules.is_some() || args.clear_rules || args.has_rule_flag_updates())
     {
         return Err(anyhow!(
@@ -693,14 +815,24 @@ fn schema_field(config_path: Option<PathBuf>, args: SchemaFieldArgs) -> Result<(
     let mut actions = Vec::new();
 
     if let Some(ref value) = args.column_type {
-        let column_type =
-            ColumnType::from_str(value).map_err(|err| anyhow!("invalid column type: {err}"))?;
-        update.column_type = Some((field.to_string(), Some(column_type.clone())));
-        actions.push(format!("type={column_type}"));
+        if reference_alias {
+            update.column_type = Some((field.to_string(), Some(ColumnType::Text)));
+            actions.push("type=reference".to_string());
+        } else {
+            let column_type =
+                ColumnType::from_str(value).map_err(|err| anyhow!("invalid column type: {err}"))?;
+            update.column_type = Some((field.to_string(), Some(column_type.clone())));
+            actions.push(format!("type={column_type}"));
+        }
     } else if args.clear_type {
         update.column_type = Some((field.to_string(), None));
         actions.push("type=cleared".to_string());
     }
+
+    let mut reference_flags_present = args.reference_integrity.is_some()
+        || args.reference_tenant.is_some()
+        || args.reference_aggregate.is_some()
+        || args.reference_cascade.is_some();
 
     if let Some(ref rules_json) = args.rules {
         let rules: FieldRules = parse_json_input(rules_json, "rules")?;
@@ -723,9 +855,52 @@ fn schema_field(config_path: Option<PathBuf>, args: SchemaFieldArgs) -> Result<(
                 field
             ));
         };
-        args.apply_rule_overrides(&mut rules)?;
+        let is_reference_field = reference_alias
+            || args.format == Some(FieldFormatArg::Reference)
+            || rules.format == Some(FieldFormat::Reference);
+        args.apply_rule_overrides(&mut rules, is_reference_field)?;
+        reference_flags_present |= args.reference_integrity.is_some()
+            || args.reference_tenant.is_some()
+            || args.reference_aggregate.is_some()
+            || args.reference_cascade.is_some();
         update.column_rules = Some((field.to_string(), Some(rules)));
         actions.push("rules=updated".to_string());
+    }
+
+    if reference_alias && !has_explicit_rule_change && !args.clear_type {
+        let mut rules = if let Some(settings) = schema.column_types.get(field) {
+            settings.rules.clone()
+        } else {
+            FieldRules::default()
+        };
+        rules.format = Some(FieldFormat::Reference);
+        rules.reference = Some(rules.reference.unwrap_or_else(ReferenceRules::default));
+        update.column_rules = Some((field.to_string(), Some(rules)));
+        actions.push("rules=reference".to_string());
+    }
+
+    if reference_flags_present
+        && !reference_alias
+        && args.format != Some(FieldFormatArg::Reference)
+        && update.column_rules.as_ref().map_or(
+            true,
+            |(_, rules)| matches!(rules, Some(r) if r.format == Some(FieldFormat::Reference)),
+        )
+    {
+        // if rules were directly set via JSON, allow; otherwise enforce format
+        if update.column_rules.is_none() {
+            return Err(anyhow!(
+                "reference flags require a reference field; set --type reference or --format reference"
+            ));
+        }
+    }
+
+    if args.lock {
+        update.field_lock = Some((field.to_string(), true));
+        actions.push("locked=true".to_string());
+    } else if args.unlock {
+        update.field_lock = Some((field.to_string(), false));
+        actions.push("locked=false".to_string());
     }
 
     if actions.is_empty() {

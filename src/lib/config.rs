@@ -199,6 +199,10 @@ pub struct Config {
     pub tenants: TenantRoutingConfig,
     #[serde(default = "default_verbose_responses")]
     pub verbose_responses: bool,
+    #[serde(default = "default_reference_default_depth")]
+    pub reference_default_depth: usize,
+    #[serde(default = "default_reference_max_depth")]
+    pub reference_max_depth: usize,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default = "default_snowflake_worker_id")]
@@ -231,6 +235,8 @@ impl Default for Config {
             socket: SocketConfig::default(),
             tenants: TenantRoutingConfig::default(),
             verbose_responses: default_verbose_responses(),
+            reference_default_depth: default_reference_default_depth(),
+            reference_max_depth: default_reference_max_depth(),
             auth: AuthConfig::default(),
             snowflake_worker_id: default_snowflake_worker_id(),
             no_noise: default_no_noise(),
@@ -249,6 +255,8 @@ pub struct ConfigUpdate {
     pub list_page_size: Option<usize>,
     pub page_limit: Option<usize>,
     pub verbose_responses: Option<bool>,
+    pub reference_default_depth: Option<usize>,
+    pub reference_max_depth: Option<usize>,
     pub plugin_max_attempts: Option<u32>,
     pub socket: Option<SocketConfigUpdate>,
     pub tenants: Option<TenantRoutingConfigUpdate>,
@@ -371,6 +379,13 @@ impl Config {
         }
         if let Some(verbose_responses) = update.verbose_responses {
             self.verbose_responses = verbose_responses;
+        }
+        if let Some(reference_default_depth) = update.reference_default_depth {
+            self.reference_default_depth =
+                reference_default_depth.min(default_reference_max_depth());
+        }
+        if let Some(reference_max_depth) = update.reference_max_depth {
+            self.reference_max_depth = reference_max_depth.max(self.reference_default_depth);
         }
         if let Some(max_attempts) = update.plugin_max_attempts {
             self.plugin_max_attempts = max_attempts.max(1);
@@ -822,6 +837,14 @@ fn default_cache_threshold() -> usize {
 
 fn default_plugin_queue_prune() -> PluginQueuePruneConfig {
     PluginQueuePruneConfig::default()
+}
+
+fn default_reference_default_depth() -> usize {
+    crate::reference::DEFAULT_RESOLUTION_DEPTH
+}
+
+fn default_reference_max_depth() -> usize {
+    crate::reference::MAX_RESOLUTION_DEPTH
 }
 
 fn default_queue_prune_done_ttl_secs() -> u64 {
