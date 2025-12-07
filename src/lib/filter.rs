@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroUsize};
+use std::{collections::BTreeMap, fmt, num::NonZeroUsize};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -152,16 +152,13 @@ fn resolve_field_value(aggregate: &AggregateState, field: &str) -> Option<Compar
         }),
         "archived" => Some(ComparableValue::Bool(aggregate.archived)),
         "version" => Some(ComparableValue::Number(aggregate.version as f64)),
-        other => select_state_field(&aggregate.state, other).map(|value| match value {
-            Value::Null => ComparableValue::Null,
-            Value::Bool(v) => ComparableValue::Bool(v),
-            Value::Number(num) => num
-                .as_f64()
-                .map(ComparableValue::Number)
-                .unwrap_or(ComparableValue::Unsupported),
-            Value::String(ref text) => ComparableValue::String(text.clone()),
-            _ => ComparableValue::Unsupported,
-        }),
+        other if other.starts_with("extensions.") => extension_field_value(
+            &aggregate.extensions,
+            other.trim_start_matches("extensions."),
+        ),
+        other => select_state_field(&aggregate.state, other)
+            .map(|value| json_value_to_comparable(&value))
+            .or_else(|| extension_field_value(&aggregate.extensions, other)),
     }
 }
 
@@ -260,17 +257,20 @@ fn metadata_field_value(metadata: &EventMetadata, field: &str) -> Option<Compara
     }
 }
 
-fn select_json_comparable(value: &Value, path: &str) -> Option<ComparableValue> {
-    if path.is_empty() {
-        return Some(json_value_to_comparable(value));
-    }
-    let target = select_json_value(value, path)?;
-    Some(json_value_to_comparable(&target))
+fn extension_field_value(
+    extensions: &BTreeMap<String, Value>,
+    path: &str,
+) -> Option<ComparableValue> {
+    select_extension_value(extensions, path).map(json_value_to_comparable)
 }
 
-fn select_json_value(value: &Value, path: &str) -> Option<Value> {
+fn select_json_comparable(value: &Value, path: &str) -> Option<ComparableValue> {
+    select_json_value_ref(value, path).map(json_value_to_comparable)
+}
+
+fn select_json_value_ref<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     if path.is_empty() {
-        return Some(value.clone());
+        return Some(value);
     }
 
     let mut current = value;
@@ -289,7 +289,42 @@ fn select_json_value(value: &Value, path: &str) -> Option<Value> {
             _ => return None,
         }
     }
-    Some(current.clone())
+    Some(current)
+}
+
+fn select_extension_value<'a>(
+    extensions: &'a BTreeMap<String, Value>,
+    path: &str,
+) -> Option<&'a Value> {
+    if extensions.is_empty() {
+        return None;
+    }
+
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut current = extensions.get(first)?;
+
+    for segment in segments {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            Value::Object(object) => {
+                current = object.get(segment)?;
+            }
+            Value::Array(array) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = array.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(current)
 }
 
 fn json_value_to_comparable(value: &Value) -> ComparableValue {
@@ -956,6 +991,7 @@ mod tests {
             aggregate_id: "order-123".to_string(),
             version: 7,
             state,
+            extensions: BTreeMap::new(),
             merkle_root: "root".to_string(),
             created_at: None,
             updated_at: None,

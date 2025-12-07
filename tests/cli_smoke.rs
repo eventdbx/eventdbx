@@ -2557,6 +2557,61 @@ fn aggregate_apply_and_get_flow() -> Result<()> {
 }
 
 #[test]
+fn aggregate_get_includes_extension_metadata_inline() -> Result<()> {
+    let cli = CliTest::new()?;
+    cli.run_json(&[
+        "schema",
+        "create",
+        "person",
+        "--events",
+        "person_updated",
+        "--json",
+    ])?;
+
+    cli.run_json(&[
+        "aggregate",
+        "create",
+        "person",
+        "person-1",
+        "--event",
+        "person.updated",
+        "--metadata",
+        r#"{"@trace":{"id":"abc123"},"@channel":"beta"}"#,
+        "--json",
+    ])?;
+
+    let detail = cli.run_json(&["aggregate", "get", "person", "person-1", "--include-events"])?;
+    let events = detail["events"]
+        .as_array()
+        .context("aggregate get response missing events array")?;
+    assert_eq!(events.len(), 1);
+    let event = events[0]
+        .as_object()
+        .context("event should render as an object")?;
+    assert!(
+        !event.contains_key("extensions"),
+        "extensions should be folded into metadata: {event:?}"
+    );
+    assert!(
+        !event.contains_key("event_type_raw"),
+        "raw event type should be hidden when rendering events: {event:?}"
+    );
+    let metadata = event["metadata"]
+        .as_object()
+        .context("event metadata should be present")?;
+    assert_eq!(metadata.get("@channel"), Some(&json!("beta")));
+    assert_eq!(
+        metadata
+            .get("@trace")
+            .and_then(Value::as_object)
+            .and_then(|trace| trace.get("id")),
+        Some(&json!("abc123"))
+    );
+    assert!(metadata.contains_key("created_at"));
+    Ok(())
+}
+
+#[test]
 fn aggregate_patch_and_select_flow() -> Result<()> {
     let cli = CliTest::new()?;
     cli.run(&[

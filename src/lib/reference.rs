@@ -689,6 +689,7 @@ mod tests {
             aggregate_id: aggregate_id.to_string(),
             version: 1,
             state,
+            extensions: BTreeMap::new(),
             merkle_root: String::new(),
             created_at: None,
             updated_at: None,

@@ -10,7 +10,7 @@ EventDBX keeps the write path small and verifiable, then lets you hang read mode
 
 ## Extension envelopes on events
 
-Writes accept an optional `--metadata` JSON object. The server stores it separately as `extensions` so system metadata (Snowflake id, timestamps, issuer) stays distinct from your own hints.
+Writes accept an optional `--metadata` JSON object. The server stores it separately as `extensions` so system metadata (Snowflake id, timestamps, issuer) stays distinct from your own hints. CLI JSON output folds those namespaced entries into the `metadata` object alongside `created_at` and `event_id` so they are not dropped when you include events; plugin payloads still receive the `extensions` map explicitly.
 
 - Keys must be namespaced with an `@` prefix (for example `@trace`, `@policy-rule`).
 - The extension map must be a JSON object and is capped at 64 KiB.
@@ -24,14 +24,12 @@ Example envelope delivered to plugins and event listings:
   "aggregate_id": "p-001",
   "event_type": "patient-updated",
   "payload": { "status": "inactive" },
-  "extensions": {
-    "@trace": { "correlation_id": "rest-1234" },
-    "@policy": { "source": "rest-api" }
-  },
   "metadata": {
     "event_id": "1234567890123",
     "created_at": "2025-02-03T12:34:56.123Z",
-    "issued_by": { "group": "admin", "user": "jane" }
+    "issued_by": { "group": "admin", "user": "jane" },
+    "@trace": { "correlation_id": "rest-1234" },
+    "@policy": { "source": "rest-api" }
   },
   "version": 5,
   "hash": "<hash>",

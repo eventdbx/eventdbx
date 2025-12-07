@@ -10,6 +10,7 @@ use eventdbx::{
         EventArchiveScope, EventCursor, EventQueryScope, EventSort, EventSortField, EventStore,
     },
 };
+use serde_json::{self, Value};
 
 #[derive(Args)]
 pub struct EventsArgs {
@@ -136,7 +137,11 @@ pub fn list(config_path: Option<PathBuf>, args: EventsArgs) -> Result<()> {
     };
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&events)?);
+        let rendered: Vec<Value> = events
+            .iter()
+            .map(|event| event.to_output_value())
+            .collect::<serde_json::Result<_>>()?;
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
         return Ok(());
     }
 
@@ -182,7 +187,8 @@ fn show_event(config_path: Option<PathBuf>, event_id_raw: &str, json: bool) -> R
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&event)?);
+        let rendered = event.to_output_value()?;
+        println!("{}", serde_json::to_string_pretty(&rendered)?);
         return Ok(());
     }
 

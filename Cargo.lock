@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "eventdbx"
-version = "3.19.2"
+version = "3.19.4"
 dependencies = [
  "aes-gcm",
  "anyhow",

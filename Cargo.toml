@@ -1,7 +1,7 @@
 [package]
 name = "eventdbx"
 description = "Immutable, event-sourced, nosql, write-side database system."
-version = "3.19.2"
+version = "3.19.4"
 edition = "2024"
 homepage = "https://github.com/eventdbx/eventdbx"
 repository = "https://github.com/eventdbx/eventdbx"

@@ -1,6 +1,6 @@
 {
   "name": "eventdbx",
-  "version": "3.19.2",
+  "version": "3.19.4",
   "description": "Immutable, event-sourced, nosql, write-side database system.",
   "license": "MIT",
   "homepage": "https://github.com/eventdbx/eventdbx#readme",

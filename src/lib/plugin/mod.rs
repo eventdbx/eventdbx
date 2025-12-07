@@ -535,6 +535,7 @@ mod tests {
             aggregate_id: record.aggregate_id.clone(),
             version: record.version,
             state: BTreeMap::from([("status".into(), "created".into())]),
+            extensions: BTreeMap::new(),
             merkle_root: record.merkle_root.clone(),
             created_at: None,
             updated_at: None,
