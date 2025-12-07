@@ -953,6 +953,12 @@ pub fn execute(config_path: Option<PathBuf>, command: AggregateCommands) -> Resu
                 "created_at": state.created_at
             });
 
+            if let Some(object) = output.as_object_mut() {
+                for (key, value) in &state.extensions {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+
             if args.include_events {
                 let events = match events_cache.take() {
                     Some(events) => events,

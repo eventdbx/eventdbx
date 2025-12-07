@@ -268,6 +268,20 @@ impl<'a> Transaction<'a> {
     }
 }
 
+fn metadata_to_extensions_map(metadata: &Value) -> BTreeMap<String, Value> {
+    match metadata.as_object() {
+        Some(map) => map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        None => {
+            let mut fallback = BTreeMap::new();
+            fallback.insert("@extensions".to_string(), metadata.clone());
+            fallback
+        }
+    }
+}
+
 fn apply_event(
     meta: &mut AggregateMeta,
     state: &mut BTreeMap<String, String>,
@@ -307,6 +321,10 @@ fn apply_event(
 
     for (key, value) in payload_map {
         state.insert(key, value);
+    }
+
+    if let Some(metadata_value) = metadata.as_ref() {
+        meta.extensions = metadata_to_extensions_map(metadata_value);
     }
 
     EventRecord {
@@ -465,6 +483,8 @@ pub struct AggregateState {
     pub aggregate_id: String,
     pub version: u64,
     pub state: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", flatten)]
+    pub extensions: BTreeMap<String, Value>,
     pub merkle_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
@@ -483,6 +503,7 @@ struct AggregateSummary {
     archived: bool,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    extensions: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -1384,6 +1405,8 @@ struct AggregateMeta {
     archived_at: Option<DateTime<Utc>>,
     #[serde(default)]
     archive_comment: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    extensions: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1401,6 +1424,7 @@ impl AggregateMeta {
             archived: false,
             archived_at: None,
             archive_comment: None,
+            extensions: BTreeMap::new(),
             created_at: None,
             updated_at: None,
         }
@@ -1994,6 +2018,10 @@ impl EventStore {
             state.insert(key, value);
         }
 
+        if let Some(metadata) = record.extensions.as_ref() {
+            meta.extensions = metadata_to_extensions_map(metadata);
+        }
+
         let record_created_at = record.metadata.created_at;
         meta.record_write(record_created_at);
         meta.event_hashes.push(record.hash.clone());
@@ -2068,6 +2096,7 @@ impl EventStore {
             archived,
             created_at,
             updated_at,
+            extensions,
             ..
         } = meta;
 
@@ -2076,6 +2105,7 @@ impl EventStore {
             aggregate_id,
             version,
             state,
+            extensions,
             merkle_root,
             created_at,
             updated_at,
@@ -3300,6 +3330,7 @@ impl EventStore {
             archived,
             created_at,
             updated_at,
+            extensions,
             ..
         } = meta;
         let state =
@@ -3309,6 +3340,7 @@ impl EventStore {
             aggregate_id,
             version,
             state,
+            extensions,
             merkle_root,
             created_at,
             updated_at,
@@ -3363,6 +3395,7 @@ impl EventStore {
                 archived,
                 created_at,
                 updated_at,
+                extensions,
                 ..
             } = meta;
             if should_sort {
@@ -3375,6 +3408,7 @@ impl EventStore {
                         archived,
                         created_at,
                         updated_at,
+                        extensions,
                     });
                 }
                 continue;
@@ -3397,6 +3431,7 @@ impl EventStore {
                 aggregate_id,
                 version,
                 state,
+                extensions,
                 merkle_root,
                 created_at,
                 updated_at,
@@ -3650,6 +3685,7 @@ impl EventStore {
                 archived,
                 created_at,
                 updated_at,
+                extensions,
                 ..
             } = meta;
             let state = match self.maybe_load_state_map(
@@ -3670,6 +3706,7 @@ impl EventStore {
                 aggregate_id,
                 version,
                 state,
+                extensions,
                 merkle_root,
                 created_at,
                 updated_at,
@@ -3727,6 +3764,7 @@ impl EventStore {
                     archived,
                     created_at,
                     updated_at,
+                    extensions,
                 } = summary;
                 let state = self.maybe_load_state_map(
                     include_state,
@@ -3739,6 +3777,7 @@ impl EventStore {
                     aggregate_id,
                     version,
                     state,
+                    extensions,
                     merkle_root,
                     created_at,
                     updated_at,
@@ -5342,6 +5381,55 @@ mod tests {
         let events = reopened.list_events("account", "acct-3").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].extensions, Some(metadata));
+    }
+
+    #[test]
+    fn aggregate_state_includes_extensions_and_flattens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_store");
+        let store = EventStore::open(path, None, 0).unwrap();
+
+        let metadata = serde_json::json!({
+            "@createdBy": "system",
+            "@trace": { "id": "abc123" }
+        });
+        store
+            .append(AppendEvent {
+                aggregate_type: "account".into(),
+                aggregate_id: "acct-4".into(),
+                event_type: "account-created".into(),
+                event_type_raw: None,
+                payload: serde_json::json!({ "status": "active" }),
+                metadata: Some(metadata),
+                issued_by: None,
+                note: None,
+                tenant: "default".into(),
+                reference_targets: Vec::new(),
+            })
+            .unwrap();
+
+        let state = store
+            .get_aggregate_state("account", "acct-4")
+            .expect("state should be readable");
+
+        assert_eq!(
+            state.extensions.get("@createdBy"),
+            Some(&serde_json::json!("system"))
+        );
+
+        let serialized =
+            serde_json::to_value(&state).expect("aggregate state should serialize to JSON");
+        assert_eq!(
+            serialized.get("@createdBy"),
+            Some(&serde_json::json!("system"))
+        );
+        assert_eq!(
+            serialized
+                .get("@trace")
+                .and_then(Value::as_object)
+                .and_then(|trace| trace.get("id")),
+            Some(&serde_json::json!("abc123"))
+        );
     }
 
     #[test]

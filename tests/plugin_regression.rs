@@ -85,6 +85,7 @@ async fn http_plugin_posts_event_payload() -> Result<()> {
         aggregate_id: record.aggregate_id.clone(),
         version: 5,
         state: BTreeMap::from([("status".into(), "created".into())]),
+        extensions: BTreeMap::new(),
         merkle_root: "state-root".into(),
         created_at: None,
         updated_at: None,

@@ -1,4 +1,4 @@
-use std::{fmt, num::NonZeroUsize};
+use std::{collections::BTreeMap, fmt, num::NonZeroUsize};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -152,16 +152,13 @@ fn resolve_field_value(aggregate: &AggregateState, field: &str) -> Option<Compar
         }),
         "archived" => Some(ComparableValue::Bool(aggregate.archived)),
         "version" => Some(ComparableValue::Number(aggregate.version as f64)),
-        other => select_state_field(&aggregate.state, other).map(|value| match value {
-            Value::Null => ComparableValue::Null,
-            Value::Bool(v) => ComparableValue::Bool(v),
-            Value::Number(num) => num
-                .as_f64()
-                .map(ComparableValue::Number)
-                .unwrap_or(ComparableValue::Unsupported),
-            Value::String(ref text) => ComparableValue::String(text.clone()),
-            _ => ComparableValue::Unsupported,
-        }),
+        other if other.starts_with("extensions.") => extension_field_value(
+            &aggregate.extensions,
+            other.trim_start_matches("extensions."),
+        ),
+        other => select_state_field(&aggregate.state, other)
+            .map(|value| json_value_to_comparable(&value))
+            .or_else(|| extension_field_value(&aggregate.extensions, other)),
     }
 }
 
@@ -258,6 +255,20 @@ fn metadata_field_value(metadata: &EventMetadata, field: &str) -> Option<Compara
         }
         _ => None,
     }
+}
+
+fn extension_field_value(
+    extensions: &BTreeMap<String, Value>,
+    path: &str,
+) -> Option<ComparableValue> {
+    if extensions.is_empty() {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    for (key, value) in extensions {
+        map.insert(key.clone(), value.clone());
+    }
+    select_json_comparable(&Value::Object(map), path)
 }
 
 fn select_json_comparable(value: &Value, path: &str) -> Option<ComparableValue> {
@@ -956,6 +967,7 @@ mod tests {
             aggregate_id: "order-123".to_string(),
             version: 7,
             state,
+            extensions: BTreeMap::new(),
             merkle_root: "root".to_string(),
             created_at: None,
             updated_at: None,
