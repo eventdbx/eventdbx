@@ -261,27 +261,16 @@ fn extension_field_value(
     extensions: &BTreeMap<String, Value>,
     path: &str,
 ) -> Option<ComparableValue> {
-    if extensions.is_empty() {
-        return None;
-    }
-    let mut map = serde_json::Map::new();
-    for (key, value) in extensions {
-        map.insert(key.clone(), value.clone());
-    }
-    select_json_comparable(&Value::Object(map), path)
+    select_extension_value(extensions, path).map(json_value_to_comparable)
 }
 
 fn select_json_comparable(value: &Value, path: &str) -> Option<ComparableValue> {
-    if path.is_empty() {
-        return Some(json_value_to_comparable(value));
-    }
-    let target = select_json_value(value, path)?;
-    Some(json_value_to_comparable(&target))
+    select_json_value_ref(value, path).map(json_value_to_comparable)
 }
 
-fn select_json_value(value: &Value, path: &str) -> Option<Value> {
+fn select_json_value_ref<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     if path.is_empty() {
-        return Some(value.clone());
+        return Some(value);
     }
 
     let mut current = value;
@@ -300,7 +289,42 @@ fn select_json_value(value: &Value, path: &str) -> Option<Value> {
             _ => return None,
         }
     }
-    Some(current.clone())
+    Some(current)
+}
+
+fn select_extension_value<'a>(
+    extensions: &'a BTreeMap<String, Value>,
+    path: &str,
+) -> Option<&'a Value> {
+    if extensions.is_empty() {
+        return None;
+    }
+
+    if path.is_empty() {
+        return None;
+    }
+
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut current = extensions.get(first)?;
+
+    for segment in segments {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            Value::Object(object) => {
+                current = object.get(segment)?;
+            }
+            Value::Array(array) => {
+                let index = segment.parse::<usize>().ok()?;
+                current = array.get(index)?;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(current)
 }
 
 fn json_value_to_comparable(value: &Value) -> ComparableValue {
