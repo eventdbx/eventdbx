@@ -139,6 +139,35 @@ impl EventRecord {
     }
 }
 
+fn normalize_extension_key(key: &str) -> String {
+    let mut result = String::new();
+    let mut chars = key.chars().peekable();
+    if let Some(first) = chars.next() {
+        if first == '@' {
+            result.push('@');
+        } else {
+            result.push(first.to_ascii_lowercase());
+        }
+    }
+
+    let mut last_char = result.chars().last().unwrap_or('@');
+    for ch in chars {
+        if ch.is_ascii_uppercase() && last_char != '@' && last_char != '_' {
+            result.push('_');
+        }
+        result.push(
+            if ch.is_ascii_alphabetic() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            },
+        );
+        last_char = ch;
+    }
+
+    result
+}
+
 impl<'a> Transaction<'a> {
     pub fn append(&mut self, input: AppendEvent) -> Result<EventRecord> {
         if let Some(note) = input.note.as_ref() {
@@ -272,7 +301,7 @@ fn metadata_to_extensions_map(metadata: &Value) -> BTreeMap<String, Value> {
     match metadata.as_object() {
         Some(map) => map
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|(key, value)| (normalize_extension_key(key), value.clone()))
             .collect(),
         None => {
             let mut fallback = BTreeMap::new();
@@ -324,7 +353,10 @@ fn apply_event(
     }
 
     if let Some(metadata_value) = metadata.as_ref() {
-        meta.extensions = metadata_to_extensions_map(metadata_value);
+        let incoming = metadata_to_extensions_map(metadata_value);
+        for (key, value) in incoming {
+            meta.extensions.insert(key, value);
+        }
     }
 
     EventRecord {
@@ -2019,7 +2051,10 @@ impl EventStore {
         }
 
         if let Some(metadata) = record.extensions.as_ref() {
-            meta.extensions = metadata_to_extensions_map(metadata);
+            let incoming = metadata_to_extensions_map(metadata);
+            for (key, value) in incoming {
+                meta.extensions.insert(key, value);
+            }
         }
 
         let record_created_at = record.metadata.created_at;
@@ -5413,14 +5448,14 @@ mod tests {
             .expect("state should be readable");
 
         assert_eq!(
-            state.extensions.get("@createdBy"),
+            state.extensions.get("@created_by"),
             Some(&serde_json::json!("system"))
         );
 
         let serialized =
             serde_json::to_value(&state).expect("aggregate state should serialize to JSON");
         assert_eq!(
-            serialized.get("@createdBy"),
+            serialized.get("@created_by"),
             Some(&serde_json::json!("system"))
         );
         assert_eq!(
@@ -5429,6 +5464,58 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|trace| trace.get("id")),
             Some(&serde_json::json!("abc123"))
+        );
+        assert!(serialized.get("@trace").is_some());
+    }
+
+    #[test]
+    fn aggregate_extensions_merge_across_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("event_store");
+        let store = EventStore::open(path, None, 0).unwrap();
+
+        store
+            .append(AppendEvent {
+                aggregate_type: "person".into(),
+                aggregate_id: "p-1".into(),
+                event_type: "person-created".into(),
+                event_type_raw: None,
+                payload: serde_json::json!({ "firstName": "Ada" }),
+                metadata: Some(serde_json::json!({ "@createdBy": "seed" })),
+                issued_by: None,
+                note: None,
+                tenant: "default".into(),
+                reference_targets: Vec::new(),
+            })
+            .unwrap();
+
+        store
+            .append(AppendEvent {
+                aggregate_type: "person".into(),
+                aggregate_id: "p-1".into(),
+                event_type: "person-updated".into(),
+                event_type_raw: None,
+                payload: serde_json::json!({ "lastName": "Lovelace" }),
+                metadata: Some(serde_json::json!({ "@updatedBy": "cli" })),
+                issued_by: None,
+                note: None,
+                tenant: "default".into(),
+                reference_targets: Vec::new(),
+            })
+            .unwrap();
+
+        let state = store
+            .get_aggregate_state("person", "p-1")
+            .expect("state should be readable");
+
+        assert_eq!(state.version, 2);
+        assert_eq!(
+            state.extensions.get("@created_by"),
+            Some(&serde_json::json!("seed"))
+        );
+        assert_eq!(
+            state.extensions.get("@updated_by"),
+            Some(&serde_json::json!("cli"))
         );
     }
 
