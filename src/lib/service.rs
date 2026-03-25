@@ -158,18 +158,43 @@ impl CoreContext {
         aggregate_type: &str,
         aggregate_id: &str,
     ) -> Result<Vec<(String, String, String, String)>> {
-        // Reference targets are domain-scoped during normalization, so we only need
-        // to inspect the current tenant instead of scanning every tenant's index.
-        let target = format!("{}#{}#{}", self.tenant_id(), aggregate_type, aggregate_id);
         let tenant = self.tenant_id().to_string();
-        self.store
-            .referrers_for(&tenant, &target)
+        self.load_referrers_with_legacy_support(aggregate_type, aggregate_id)
             .map(|refs| {
                 refs.into_iter()
                     .map(|(agg_type, agg_id, path)| (tenant.clone(), agg_type, agg_id, path))
                     .collect()
             })
             .map_err(Into::into)
+    }
+
+    fn load_referrers_with_legacy_support(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let tenant = self.tenant_id().to_string();
+        let targets = [
+            format!("{}#{}", aggregate_type, aggregate_id),
+            format!("{}#{}#{}", tenant, aggregate_type, aggregate_id),
+        ];
+        let mut seen = BTreeSet::new();
+        let mut referrers = Vec::new();
+        for target in targets {
+            for (ref_aggregate_type, ref_aggregate_id, path) in
+                self.store.referrers_for(&tenant, &target)?
+            {
+                let key = (
+                    ref_aggregate_type.clone(),
+                    ref_aggregate_id.clone(),
+                    path.clone(),
+                );
+                if seen.insert(key) {
+                    referrers.push((ref_aggregate_type, ref_aggregate_id, path));
+                }
+            }
+        }
+        Ok(referrers)
     }
 
     fn nullify_referrers(
@@ -362,19 +387,11 @@ impl CoreContext {
         let schemas = self.schemas();
         let store = self.store();
         let tokens = self.tokens();
-        let tenant = self.tenant_id().to_string();
         let hops = depth
             .unwrap_or(self.reference_default_depth)
             .min(self.reference_max_depth);
 
-        let resolved = resolve_references(tenant.clone(), root, &schemas, hops, |reference| {
-            if !reference.domain.eq_ignore_ascii_case(&tenant) {
-                return Ok(ReferenceFetchOutcome {
-                    status: ReferenceResolutionStatus::Forbidden,
-                    aggregate: None,
-                });
-            }
-
+        let resolved = resolve_references(root, &schemas, hops, |reference| {
             let resource = format!(
                 "aggregate:{}:{}",
                 reference.aggregate_type, reference.aggregate_id
@@ -543,8 +560,7 @@ impl CoreContext {
             return Err(EventError::AggregateNotFound);
         }
 
-        let target = format!("{}#{}#{}", self.tenant_id(), aggregate_type, aggregate_id);
-        let referrers = self.store.referrers_for(self.tenant_id(), &target)?;
+        let referrers = self.load_referrers_with_legacy_support(aggregate_type, aggregate_id)?;
         Ok(referrers
             .into_iter()
             .filter_map(|(agg_type, agg_id, path)| {
@@ -686,7 +702,7 @@ impl CoreContext {
                 )));
             }
 
-            let target = format!("{}#{}#{}", self.tenant_id(), aggregate_type, aggregate_id);
+            let target = format!("{}#{}", aggregate_type, aggregate_id);
             self.nullify_referrers(&nullify, &target)?;
         }
         let state = store.set_archive(&aggregate_type, &aggregate_id, archived, comment)?;
@@ -894,18 +910,13 @@ impl CoreContext {
         if schema_present {
             schemas.validate_event(&aggregate_type, &event_type, &effective_payload)?;
             let reference_context = ReferenceContext {
-                domain: self.tenant_id(),
                 aggregate_type: &aggregate_type,
             };
             let store = self.store();
             let tokens = self.tokens();
-            let tenant = self.tenant_id().to_string();
             let mut resolver = move |reference: &AggregateReference,
                                      _integrity: ReferenceIntegrity|
                   -> Result<ReferenceResolutionStatus> {
-                if !reference.domain.eq_ignore_ascii_case(tenant.as_str()) {
-                    return Ok(ReferenceResolutionStatus::Forbidden);
-                }
                 let resource = format!(
                     "aggregate:{}:{}",
                     reference.aggregate_type, reference.aggregate_id
@@ -1073,4 +1084,101 @@ pub(crate) fn normalize_optional_note(note: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Config, schema::SchemaManager, store::AppendEvent,
+        tenant_store::TenantAssignmentStore, token::TokenManager,
+    };
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_referrers_with_legacy_support_reads_old_and_new_targets() {
+        let dir = tempdir().expect("tempdir");
+        let config = Config::default();
+        let store = Arc::new(
+            EventStore::open(dir.path().join("event_store"), None, 0).expect("open store"),
+        );
+        let schemas =
+            Arc::new(SchemaManager::load(dir.path().join("schemas.json")).expect("load schemas"));
+        let tokens = Arc::new(
+            TokenManager::load(
+                config.jwt_manager_config().expect("jwt config"),
+                dir.path().join("tokens.json"),
+                dir.path().join("token-revocations.json"),
+                None,
+            )
+            .expect("load tokens"),
+        );
+        let assignments = Arc::new(
+            TenantAssignmentStore::open(dir.path().join("tenant-meta")).expect("open assignments"),
+        );
+        let core = CoreContext::new(
+            tokens,
+            schemas,
+            Arc::clone(&store),
+            config.restrict,
+            config.list_page_size,
+            config.page_limit,
+            "default",
+            None,
+            None,
+            assignments,
+            config.reference_default_depth,
+            config.reference_max_depth,
+        );
+
+        store
+            .append(AppendEvent {
+                aggregate_type: "farm".into(),
+                aggregate_id: "farm-1".into(),
+                event_type: "created".into(),
+                event_type_raw: None,
+                payload: serde_json::json!({ "address": "default#address#addr-1" }),
+                metadata: None,
+                issued_by: None,
+                note: None,
+                tenant: "default".into(),
+                reference_targets: vec![("default#address#addr-1".into(), "/address".into())],
+            })
+            .expect("append legacy referrer");
+        store
+            .append(AppendEvent {
+                aggregate_type: "barn".into(),
+                aggregate_id: "barn-1".into(),
+                event_type: "created".into(),
+                event_type_raw: None,
+                payload: serde_json::json!({ "address": "address#addr-1" }),
+                metadata: None,
+                issued_by: None,
+                note: None,
+                tenant: "default".into(),
+                reference_targets: vec![("address#addr-1".into(), "/address".into())],
+            })
+            .expect("append new referrer");
+
+        let referrers = core
+            .load_referrers_with_legacy_support("address", "addr-1")
+            .expect("load referrers");
+
+        assert_eq!(referrers.len(), 2);
+        assert!(
+            referrers
+                .iter()
+                .any(|(aggregate_type, aggregate_id, path)| {
+                    aggregate_type == "farm" && aggregate_id == "farm-1" && path == "/address"
+                })
+        );
+        assert!(
+            referrers
+                .iter()
+                .any(|(aggregate_type, aggregate_id, path)| {
+                    aggregate_type == "barn" && aggregate_id == "barn-1" && path == "/address"
+                })
+        );
+    }
 }

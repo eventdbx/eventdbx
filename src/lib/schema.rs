@@ -756,6 +756,7 @@ impl SchemaManager {
         } else {
             serde_json::from_str(&contents)?
         };
+        validate_loaded_schema_map(&map)?;
 
         Ok(Self {
             path,
@@ -889,6 +890,11 @@ impl SchemaManager {
                                 new_rules.properties =
                                     std::mem::take(&mut settings.rules.properties);
                             }
+                            let probe = ColumnSettings {
+                                column_type: settings.column_type.clone(),
+                                rules: new_rules.clone(),
+                            };
+                            validate_column_setting_configuration(&field, &probe)?;
                             settings.rules = new_rules;
                         }
                         None => {
@@ -960,7 +966,6 @@ impl SchemaManager {
                 }
                 schema_event.notes = note;
             }
-
             schema.ensure_sorted();
             schema.updated_at = Utc::now();
         }
@@ -1191,6 +1196,43 @@ fn validate_columns(
     Ok(())
 }
 
+fn validate_loaded_schema_map(items: &BTreeMap<String, AggregateSchema>) -> Result<()> {
+    for schema in items.values() {
+        validate_schema_configuration(schema)?;
+    }
+    Ok(())
+}
+
+fn validate_schema_configuration(schema: &AggregateSchema) -> Result<()> {
+    validate_column_settings_configuration(&schema.column_types, "")
+}
+
+fn validate_column_settings_configuration(
+    definitions: &BTreeMap<String, ColumnSettings>,
+    prefix: &str,
+) -> Result<()> {
+    for (field, definition) in definitions {
+        let path = join_path(prefix, field);
+        validate_column_setting_configuration(&path, definition)?;
+    }
+    Ok(())
+}
+
+fn validate_column_setting_configuration(path: &str, definition: &ColumnSettings) -> Result<()> {
+    if let Some(reference) = definition.rules.reference.as_ref() {
+        if let Some(tenant) = reference.tenant.as_ref() {
+            return Err(EventError::InvalidSchema(format!(
+                "field {} uses unsupported reference.tenant rule ({tenant}); domain-scoped references are no longer supported",
+                path
+            )));
+        }
+    }
+    if !definition.rules.properties.is_empty() {
+        validate_column_settings_configuration(&definition.rules.properties, path)?;
+    }
+    Ok(())
+}
+
 fn normalize_reference_columns<F>(
     definitions: &BTreeMap<String, ColumnSettings>,
     payload: &mut JsonMap<String, Value>,
@@ -1393,19 +1435,6 @@ where
                 .as_ref()
                 .map(|rules| rules.integrity)
                 .unwrap_or_default();
-            if let Some(expected_tenant) = settings
-                .rules
-                .reference
-                .as_ref()
-                .and_then(|rules| rules.tenant.as_ref())
-            {
-                if !reference.domain.eq_ignore_ascii_case(expected_tenant) {
-                    return Err(EventError::SchemaViolation(format!(
-                        "reference {} must target tenant/domain {}",
-                        path, expected_tenant
-                    )));
-                }
-            }
             if let Some(expected_aggregate) = settings
                 .rules
                 .reference
@@ -1807,20 +1836,20 @@ fn validate_reference_shape(path: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(EventError::SchemaViolation(format!(
-            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            "field {} must use reference notation aggregate#id or #id",
             path
         )));
     }
     if !trimmed.contains('#') {
         return Err(EventError::SchemaViolation(format!(
-            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            "field {} must use reference notation aggregate#id or #id",
             path
         )));
     }
     let parts: Vec<_> = trimmed.split('#').collect();
     if !(parts.len() == 2 || parts.len() == 3) {
         return Err(EventError::SchemaViolation(format!(
-            "field {} must use reference notation domain#aggregate#id, aggregate#id, or #id",
+            "field {} must use reference notation aggregate#id or #id",
             path
         )));
     }
@@ -2167,11 +2196,10 @@ mod tests {
                 "farm",
                 payload,
                 ReferenceContext {
-                    domain: "farm",
                     aggregate_type: "farm",
                 },
                 |reference, _| {
-                    assert_eq!(reference.to_string(), "farm#farm#123");
+                    assert_eq!(reference.to_string(), "farm#123");
                     Ok(ReferenceResolutionStatus::Ok)
                 },
             )
@@ -2181,7 +2209,7 @@ mod tests {
             .as_object()
             .and_then(|map| map.get("address"))
             .and_then(Value::as_str);
-        assert_eq!(address, Some("farm#farm#123"));
+        assert_eq!(address, Some("farm#123"));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, ReferenceResolutionStatus::Ok);
     }
@@ -2218,7 +2246,6 @@ mod tests {
                 "farm",
                 payload,
                 ReferenceContext {
-                    domain: "farm",
                     aggregate_type: "farm",
                 },
                 |_reference, _| Ok(ReferenceResolutionStatus::NotFound),
@@ -2263,7 +2290,6 @@ mod tests {
                 "farm",
                 payload,
                 ReferenceContext {
-                    domain: "farm",
                     aggregate_type: "farm",
                 },
                 |_reference, _| Ok(ReferenceResolutionStatus::NotFound),
@@ -2274,13 +2300,13 @@ mod tests {
             .as_object()
             .and_then(|map| map.get("address"))
             .and_then(Value::as_str);
-        assert_eq!(address, Some("farm#address#missing"));
+        assert_eq!(address, Some("address#missing"));
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, ReferenceResolutionStatus::NotFound);
     }
 
     #[test]
-    fn normalize_references_enforces_tenant_and_aggregate_rules() {
+    fn update_rejects_legacy_reference_tenant_rules() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("schemas.json");
         let manager = SchemaManager::load(path).unwrap();
@@ -2307,34 +2333,8 @@ mod tests {
 
         let mut rules_update = SchemaUpdate::default();
         rules_update.column_rules = Some(("address".into(), Some(rules)));
-        manager.update("farm", rules_update).unwrap();
-
-        let payload = json!({ "address": "geo#address#123" });
-        manager
-            .normalize_references(
-                "farm",
-                payload,
-                ReferenceContext {
-                    domain: "farm",
-                    aggregate_type: "farm",
-                },
-                |_reference, _| Ok(ReferenceResolutionStatus::Ok),
-            )
-            .expect("matching tenant/aggregate should pass");
-
-        let payload = json!({ "address": "farm#address#123" });
-        let err = manager
-            .normalize_references(
-                "farm",
-                payload,
-                ReferenceContext {
-                    domain: "farm",
-                    aggregate_type: "farm",
-                },
-                |_reference, _| Ok(ReferenceResolutionStatus::Ok),
-            )
-            .unwrap_err();
-        assert!(matches!(err, EventError::SchemaViolation(_)));
+        let err = manager.update("farm", rules_update).unwrap_err();
+        assert!(matches!(err, EventError::InvalidSchema(_)));
     }
 
     #[test]

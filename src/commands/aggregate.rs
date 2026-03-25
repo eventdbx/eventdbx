@@ -604,7 +604,7 @@ fn maybe_auto_snapshot(store: &EventStore, schemas: &SchemaManager, record: &Eve
 fn normalize_references_offline(
     schemas: &SchemaManager,
     store: &EventStore,
-    tenant: &str,
+    _tenant: &str,
     aggregate: &str,
     payload: Value,
 ) -> Result<(Value, Vec<(String, String)>)> {
@@ -615,15 +615,11 @@ fn normalize_references_offline(
     };
 
     let context = ReferenceContext {
-        domain: tenant,
         aggregate_type: aggregate,
     };
     let mut resolver = |reference: &AggregateReference,
                         _integrity: ReferenceIntegrity|
      -> eventdbx::error::Result<ReferenceResolutionStatus> {
-        if !reference.domain.eq_ignore_ascii_case(tenant) {
-            return Ok(ReferenceResolutionStatus::Forbidden);
-        }
         match store.aggregate_version(&reference.aggregate_type, &reference.aggregate_id) {
             Ok(Some(_)) => Ok(ReferenceResolutionStatus::Ok),
             Ok(None) => Ok(ReferenceResolutionStatus::NotFound),

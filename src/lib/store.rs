@@ -4379,7 +4379,7 @@ impl EventStore {
         batch.delete(meta_key(aggregate_type, aggregate_id));
         batch.delete(state_key(aggregate_type, aggregate_id));
         self.sync_timestamp_indexes(&mut batch, AggregateIndex::Active, Some(&meta), None);
-        // best-effort cleanup of reference index entries (tenant/domain handled by caller)
+        // best-effort cleanup of reference index entries (tenant handled by caller)
         self.write_batch(batch)
     }
 
@@ -6008,18 +6008,16 @@ mod tests {
                 aggregate_id: "farm-1".into(),
                 event_type: "created".into(),
                 event_type_raw: None,
-                payload: serde_json::json!({ "address": "beta#address#addr-1" }),
+                payload: serde_json::json!({ "address": "address#addr-1" }),
                 metadata: None,
                 issued_by: None,
                 note: None,
                 tenant: "alpha".into(),
-                reference_targets: vec![("beta#address#addr-1".into(), "/address".into())],
+                reference_targets: vec![("address#addr-1".into(), "/address".into())],
             })
             .unwrap();
 
-        let refs = store
-            .referrers_for_any_tenant("beta#address#addr-1")
-            .unwrap();
+        let refs = store.referrers_for_any_tenant("address#addr-1").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].0, "alpha");
         assert_eq!(refs[0].1, "farm");

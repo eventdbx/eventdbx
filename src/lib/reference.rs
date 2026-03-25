@@ -11,7 +11,6 @@ use crate::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AggregateReference {
-    pub domain: String,
     pub aggregate_type: String,
     pub aggregate_id: String,
 }
@@ -81,7 +80,6 @@ impl Default for ReferenceRules {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReferenceContext<'a> {
-    pub domain: &'a str,
     pub aggregate_type: &'a str,
 }
 
@@ -95,43 +93,50 @@ impl AggregateReference {
         }
 
         let parts: Vec<&str> = trimmed.split('#').collect();
-        let (domain, aggregate_type, aggregate_id) = match parts.len() {
-            3 => (parts[0], parts[1], parts[2]),
+        let (aggregate_type, aggregate_id) = match parts.len() {
+            3 => {
+                normalize_domain(parts[0])?;
+                (parts[1], parts[2])
+            }
             2 => {
                 if parts[0].is_empty() {
-                    (context.domain, context.aggregate_type, parts[1])
+                    (context.aggregate_type, parts[1])
                 } else {
-                    (context.domain, parts[0], parts[1])
+                    (parts[0], parts[1])
                 }
             }
             _ => {
                 return Err(EventError::SchemaViolation(
-                    "reference must be domain#aggregate#id, aggregate#id, or #id".into(),
+                    "reference must be aggregate#id or #id".into(),
                 ));
             }
         };
 
-        if aggregate_id.is_empty() || aggregate_type.is_empty() || domain.is_empty() {
+        if aggregate_id.is_empty() || aggregate_type.is_empty() {
             return Err(EventError::SchemaViolation(
                 "reference segments cannot be empty".into(),
             ));
         }
 
-        let domain = normalize_domain(domain)?;
         let aggregate_type = normalize_aggregate_type(aggregate_type)?;
         let aggregate_id = normalize_aggregate_id(aggregate_id)?;
 
         Ok(Self {
-            domain,
             aggregate_type,
             aggregate_id,
         })
     }
 
     pub fn to_canonical(&self) -> String {
+        format!("{}#{}", self.aggregate_type, self.aggregate_id)
+    }
+
+    pub fn to_legacy_canonical(&self, tenant: &str) -> String {
         format!(
             "{}#{}#{}",
-            self.domain, self.aggregate_type, self.aggregate_id
+            normalize_domain(tenant).unwrap_or_else(|_| tenant.trim().to_ascii_lowercase()),
+            self.aggregate_type,
+            self.aggregate_id
         )
     }
 }
@@ -167,7 +172,6 @@ pub struct Referrer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedAggregate {
-    pub domain: String,
     pub aggregate: AggregateState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<ResolvedReference>,
@@ -227,21 +231,18 @@ fn normalize_aggregate_id(value: &str) -> Result<String> {
 
 #[derive(Debug, Clone)]
 struct VisitedKey {
-    domain: String,
     aggregate_type: String,
     aggregate_id: String,
 }
 
 impl VisitedKey {
     fn matches(&self, reference: &AggregateReference) -> bool {
-        self.domain.eq_ignore_ascii_case(&reference.domain)
-            && self.aggregate_type == reference.aggregate_type
+        self.aggregate_type == reference.aggregate_type
             && self.aggregate_id == reference.aggregate_id
     }
 }
 
 pub fn resolve_references<F>(
-    root_domain: String,
     root: AggregateState,
     schemas: &SchemaManager,
     depth: usize,
@@ -252,11 +253,10 @@ where
 {
     let hops = depth.min(MAX_RESOLUTION_DEPTH);
     let mut stack = Vec::new();
-    resolve_references_inner(root_domain, root, schemas, hops, &mut fetcher, &mut stack)
+    resolve_references_inner(root, schemas, hops, &mut fetcher, &mut stack)
 }
 
 fn resolve_references_inner<F>(
-    domain: String,
     aggregate: AggregateState,
     schemas: &SchemaManager,
     hops_remaining: usize,
@@ -267,7 +267,6 @@ where
     F: FnMut(&AggregateReference) -> Result<ReferenceFetchOutcome>,
 {
     let context = ReferenceContext {
-        domain: &domain,
         aggregate_type: &aggregate.aggregate_type,
     };
     let located =
@@ -275,7 +274,6 @@ where
 
     let mut resolved = Vec::new();
     let key = VisitedKey {
-        domain: domain.clone(),
         aggregate_type: aggregate.aggregate_type.clone(),
         aggregate_id: aggregate.aggregate_id.clone(),
     };
@@ -317,7 +315,6 @@ where
         if status == ReferenceResolutionStatus::Ok {
             let child = aggregate_opt.expect("child aggregate must be present on ok status");
             let next = resolve_references_inner(
-                reference.reference.domain.clone(),
                 child,
                 schemas,
                 hops_remaining.saturating_sub(1),
@@ -342,7 +339,6 @@ where
 
     stack.pop();
     Ok(ResolvedAggregate {
-        domain,
         aggregate,
         references: resolved,
     })
@@ -360,28 +356,24 @@ mod tests {
     #[test]
     fn parses_canonical_reference() {
         let context = ReferenceContext {
-            domain: "default",
             aggregate_type: "farm",
         };
         let reference =
             AggregateReference::parse("geo#address#123", context).expect("reference should parse");
 
-        assert_eq!(reference.domain, "geo");
         assert_eq!(reference.aggregate_type, "address");
         assert_eq!(reference.aggregate_id, "123");
-        assert_eq!(reference.to_string(), "geo#address#123");
+        assert_eq!(reference.to_string(), "address#123");
     }
 
     #[test]
-    fn fills_domain_when_missing() {
+    fn parses_domainless_reference() {
         let context = ReferenceContext {
-            domain: "farm",
             aggregate_type: "farm",
         };
         let reference =
             AggregateReference::parse("address#123", context).expect("reference should parse");
 
-        assert_eq!(reference.domain, "farm");
         assert_eq!(reference.aggregate_type, "address");
         assert_eq!(reference.aggregate_id, "123");
     }
@@ -389,12 +381,10 @@ mod tests {
     #[test]
     fn uses_context_for_shorthand_id() {
         let context = ReferenceContext {
-            domain: "farm",
             aggregate_type: "cattle",
         };
         let reference = AggregateReference::parse("#abc-123", context).expect("should parse");
 
-        assert_eq!(reference.domain, "farm");
         assert_eq!(reference.aggregate_type, "cattle");
         assert_eq!(reference.aggregate_id, "abc-123");
     }
@@ -402,7 +392,6 @@ mod tests {
     #[test]
     fn rejects_invalid_shapes() {
         let context = ReferenceContext {
-            domain: "farm",
             aggregate_type: "cattle",
         };
         for raw in ["", "just-id", "a#b#c#d", "#", "farm##123"] {
@@ -422,31 +411,25 @@ mod tests {
             })
             .unwrap();
 
-        let farm = sample_state("farm", "1", &[("address", "default#address#1")]);
+        let farm = sample_state("farm", "1", &[("address", "address#1")]);
         let address = sample_state("address", "1", &[]);
 
         let mut aggregates = std::collections::HashMap::new();
-        aggregates.insert("default#farm#1".to_string(), farm.clone());
-        aggregates.insert("default#address#1".to_string(), address.clone());
+        aggregates.insert("farm#1".to_string(), farm.clone());
+        aggregates.insert("address#1".to_string(), address.clone());
 
-        let resolved = resolve_references(
-            "default".into(),
-            farm,
-            &manager,
-            DEFAULT_RESOLUTION_DEPTH,
-            |reference| {
-                let key = reference.to_canonical();
-                let aggregate = aggregates.get(&key).cloned();
-                Ok(ReferenceFetchOutcome {
-                    status: if aggregate.is_some() {
-                        ReferenceResolutionStatus::Ok
-                    } else {
-                        ReferenceResolutionStatus::NotFound
-                    },
-                    aggregate,
-                })
-            },
-        )
+        let resolved = resolve_references(farm, &manager, DEFAULT_RESOLUTION_DEPTH, |reference| {
+            let key = reference.to_canonical();
+            let aggregate = aggregates.get(&key).cloned();
+            Ok(ReferenceFetchOutcome {
+                status: if aggregate.is_some() {
+                    ReferenceResolutionStatus::Ok
+                } else {
+                    ReferenceResolutionStatus::NotFound
+                },
+                aggregate,
+            })
+        })
         .expect("resolution should succeed");
 
         assert_eq!(resolved.references.len(), 1);
@@ -474,31 +457,25 @@ mod tests {
             .unwrap();
         add_reference_field(&manager, "address", "owner");
 
-        let farm = sample_state("farm", "1", &[("address", "default#address#1")]);
-        let address = sample_state("address", "1", &[("owner", "default#farm#1")]);
+        let farm = sample_state("farm", "1", &[("address", "address#1")]);
+        let address = sample_state("address", "1", &[("owner", "farm#1")]);
 
         let mut aggregates = std::collections::HashMap::new();
-        aggregates.insert("default#farm#1".to_string(), farm.clone());
-        aggregates.insert("default#address#1".to_string(), address.clone());
+        aggregates.insert("farm#1".to_string(), farm.clone());
+        aggregates.insert("address#1".to_string(), address.clone());
 
-        let resolved = resolve_references(
-            "default".into(),
-            farm,
-            &manager,
-            DEFAULT_RESOLUTION_DEPTH,
-            |reference| {
-                let key = reference.to_canonical();
-                let aggregate = aggregates.get(&key).cloned();
-                Ok(ReferenceFetchOutcome {
-                    status: if aggregate.is_some() {
-                        ReferenceResolutionStatus::Ok
-                    } else {
-                        ReferenceResolutionStatus::NotFound
-                    },
-                    aggregate,
-                })
-            },
-        )
+        let resolved = resolve_references(farm, &manager, DEFAULT_RESOLUTION_DEPTH, |reference| {
+            let key = reference.to_canonical();
+            let aggregate = aggregates.get(&key).cloned();
+            Ok(ReferenceFetchOutcome {
+                status: if aggregate.is_some() {
+                    ReferenceResolutionStatus::Ok
+                } else {
+                    ReferenceResolutionStatus::NotFound
+                },
+                aggregate,
+            })
+        })
         .expect("resolution should succeed");
 
         let first = resolved
@@ -533,16 +510,16 @@ mod tests {
             .unwrap();
         add_reference_field(&manager, "address", "facility");
 
-        let farm = sample_state("farm", "1", &[("address", "default#address#1")]);
-        let address = sample_state("address", "1", &[("facility", "default#facility#9")]);
+        let farm = sample_state("farm", "1", &[("address", "address#1")]);
+        let address = sample_state("address", "1", &[("facility", "facility#9")]);
         let facility = sample_state("facility", "9", &[]);
 
         let mut aggregates = std::collections::HashMap::new();
-        aggregates.insert("default#farm#1".to_string(), farm.clone());
-        aggregates.insert("default#address#1".to_string(), address.clone());
-        aggregates.insert("default#facility#9".to_string(), facility.clone());
+        aggregates.insert("farm#1".to_string(), farm.clone());
+        aggregates.insert("address#1".to_string(), address.clone());
+        aggregates.insert("facility#9".to_string(), facility.clone());
 
-        let resolved = resolve_references("default".into(), farm, &manager, 1, |reference| {
+        let resolved = resolve_references(farm, &manager, 1, |reference| {
             let key = reference.to_canonical();
             let aggregate = aggregates.get(&key).cloned();
             Ok(ReferenceFetchOutcome {
@@ -570,33 +547,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_references_cross_domain_allows_when_fetcher_permits() {
+    fn resolve_references_accepts_legacy_three_part_strings() {
         let (manager, _guard) = prepare_schema_with_reference("farm", "address");
 
         let farm = sample_state("farm", "1", &[("address", "geo#address#1")]);
         let address = sample_state("address", "1", &[]);
 
         let mut aggregates = std::collections::HashMap::new();
-        aggregates.insert("geo#address#1".to_string(), address.clone());
+        aggregates.insert("address#1".to_string(), address.clone());
 
-        let resolved = resolve_references(
-            "default".into(),
-            farm,
-            &manager,
-            DEFAULT_RESOLUTION_DEPTH,
-            |reference| {
-                let key = reference.to_canonical();
-                let aggregate = aggregates.get(&key).cloned();
-                Ok(ReferenceFetchOutcome {
-                    status: if aggregate.is_some() {
-                        ReferenceResolutionStatus::Ok
-                    } else {
-                        ReferenceResolutionStatus::NotFound
-                    },
-                    aggregate,
-                })
-            },
-        )
+        let resolved = resolve_references(farm, &manager, DEFAULT_RESOLUTION_DEPTH, |reference| {
+            let key = reference.to_canonical();
+            let aggregate = aggregates.get(&key).cloned();
+            Ok(ReferenceFetchOutcome {
+                status: if aggregate.is_some() {
+                    ReferenceResolutionStatus::Ok
+                } else {
+                    ReferenceResolutionStatus::NotFound
+                },
+                aggregate,
+            })
+        })
         .expect("resolution should succeed");
 
         let first = resolved
@@ -604,7 +575,7 @@ mod tests {
             .first()
             .expect("reference should be present");
         assert_eq!(first.status, ReferenceResolutionStatus::Ok);
-        assert_eq!(first.reference.domain, "geo");
+        assert_eq!(first.reference.to_string(), "address#1");
         let child = first
             .resolved
             .as_ref()
@@ -616,23 +587,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_references_cross_domain_marks_forbidden_when_fetcher_blocks() {
+    fn resolve_references_marks_forbidden_when_fetcher_blocks() {
         let (manager, _guard) = prepare_schema_with_reference("farm", "address");
 
         let farm = sample_state("farm", "1", &[("address", "geo#address#1")]);
 
-        let resolved = resolve_references(
-            "default".into(),
-            farm,
-            &manager,
-            DEFAULT_RESOLUTION_DEPTH,
-            |_reference| {
-                Ok(ReferenceFetchOutcome {
-                    status: ReferenceResolutionStatus::Forbidden,
-                    aggregate: None,
-                })
-            },
-        )
+        let resolved = resolve_references(farm, &manager, DEFAULT_RESOLUTION_DEPTH, |_reference| {
+            Ok(ReferenceFetchOutcome {
+                status: ReferenceResolutionStatus::Forbidden,
+                aggregate: None,
+            })
+        })
         .expect("resolution should succeed");
 
         let first = resolved
