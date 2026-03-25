@@ -27,6 +27,7 @@ jobs:
           else
             TAG="v${VERSION}"
           fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -43,14 +44,19 @@ jobs:
           driver: cloud
           endpoint: "thachp/eventdbx"
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
+          pull: true
+          push: true
           tags: |
             ${{ vars.DOCKER_USER }}/eventdbx:${{ steps.crate_version.outputs.tag }}
-            ${{ vars.DOCKER_USER }}/eventdbx:latest            
+            ${{ vars.DOCKER_USER }}/eventdbx:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/thachp/eventdbx
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.crate_version.outputs.version }}
           platforms: linux/amd64,linux/arm64
-          # For pull requests, export results to the build cache.
-          # Otherwise, push to a registry with multi-arch manifests so Docker Desktop on Linux, Windows, and macOS
-          # can pull the right arch (amd64 or arm64).
-          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || 'type=registry' }}
+          provenance: mode=max
+          sbom: true
   

@@ -48,6 +48,7 @@ dbx serve start --foreground
 ```
 
 Use `dbx serve status` to inspect the daemon, `dbx serve restart` to restart it, and `dbx serve stop` when you want to shut it down.
+The published Docker image sets `EVENTDBX_AUTO_INIT=1`, so a first run against an empty `/var/lib/eventdbx` volume will create `/var/lib/eventdbx/.dbx/config.toml` automatically before the server starts.
 
 3. Author a schema in `schema.dbx`:
 

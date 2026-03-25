@@ -32,6 +32,7 @@ pub const WORKSPACE_DIR_NAME: &str = ".dbx";
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 
+const ENV_AUTO_INIT_WORKSPACE: &str = "EVENTDBX_AUTO_INIT";
 const ENV_DATA_ENCRYPTION_KEY: &str = "EVENTDBX_DATA_ENCRYPTION_KEY";
 const ENV_AUTH_PRIVATE_KEY: &str = "EVENTDBX_AUTH_PRIVATE_KEY";
 const ENV_AUTH_PUBLIC_KEY: &str = "EVENTDBX_AUTH_PUBLIC_KEY";
@@ -311,11 +312,45 @@ pub fn init_workspace(path: Option<PathBuf>) -> Result<(Config, PathBuf, bool)> 
 }
 
 pub fn load_or_default(path: Option<PathBuf>) -> Result<(Config, PathBuf)> {
-    let config_path = match path {
-        Some(path) => normalize_path(path)?,
-        None => default_config_path()?,
-    };
+    let auto_init = auto_init_workspace_enabled();
+    let config_path = resolve_config_path_for_load(path, auto_init)?;
+    maybe_auto_init_workspace(config_path.as_path(), auto_init)?;
     load_config(config_path)
+}
+
+fn resolve_config_path_for_load(path: Option<PathBuf>, auto_init: bool) -> Result<PathBuf> {
+    match path {
+        Some(path) => normalize_path(path),
+        None if auto_init => init_config_path(None),
+        None => default_config_path(),
+    }
+}
+
+fn auto_init_workspace_enabled() -> bool {
+    matches!(
+        env::var(ENV_AUTO_INIT_WORKSPACE),
+        Ok(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+    )
+}
+
+fn maybe_auto_init_workspace(config_path: &Path, auto_init: bool) -> Result<()> {
+    if !auto_init || config_path.exists() {
+        return Ok(());
+    }
+
+    let (_, resolved_path, created) = init_workspace(Some(config_path.to_path_buf()))?;
+    if created {
+        tracing::info!(
+            "auto-initialized EventDBX workspace at {}",
+            resolved_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 impl Config {
@@ -1306,6 +1341,56 @@ mod tests {
         );
         assert!(resolved_path.exists());
         assert!(config.event_store_path().join("CURRENT").exists());
+    }
+
+    #[test]
+    fn auto_init_workspace_creates_missing_config_when_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let config_path = temp
+            .path()
+            .join("project")
+            .join(WORKSPACE_DIR_NAME)
+            .join(CONFIG_FILE_NAME);
+
+        assert!(!config_path.exists());
+
+        maybe_auto_init_workspace(config_path.as_path(), true)
+            .expect("auto init should create workspace");
+
+        assert!(config_path.exists());
+        let (config, resolved_path) =
+            load_config(config_path.clone()).expect("auto-initialized config should load");
+        assert_eq!(resolved_path, config_path);
+        assert!(config.event_store_path().join("CURRENT").exists());
+    }
+
+    #[test]
+    fn auto_init_workspace_leaves_missing_config_when_disabled() {
+        let temp = tempdir().expect("temp dir");
+        let config_path = temp
+            .path()
+            .join("project")
+            .join(WORKSPACE_DIR_NAME)
+            .join(CONFIG_FILE_NAME);
+
+        maybe_auto_init_workspace(config_path.as_path(), false)
+            .expect("disabled auto init should be a no-op");
+
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn resolve_config_path_for_load_uses_local_workspace_path_when_auto_init_enabled() {
+        let temp = tempdir().expect("temp dir");
+        let original_cwd = env::current_dir().expect("current dir");
+        env::set_current_dir(temp.path()).expect("change current dir");
+
+        let resolved = resolve_config_path_for_load(None, true)
+            .expect("auto-init path resolution should succeed");
+
+        env::set_current_dir(original_cwd).expect("restore current dir");
+
+        assert!(resolved.ends_with(Path::new(WORKSPACE_DIR_NAME).join(CONFIG_FILE_NAME)));
     }
 }
 
