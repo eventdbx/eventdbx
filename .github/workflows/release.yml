@@ -321,6 +321,27 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+      - name: Read npm package name
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        id: npm_package
+        run: echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+      - name: Verify npm auth and ownership
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME="${{ steps.npm_package.outputs.name }}"
+          NPM_USER="$(npm whoami)"
+          echo "Authenticated to npm as ${NPM_USER}"
+
+          OWNERS="$(npm owner ls "${PACKAGE_NAME}")"
+          echo "Owners for ${PACKAGE_NAME}:"
+          echo "${OWNERS}"
+
+          if ! printf '%s\n' "${OWNERS}" | grep -Fq "${NPM_USER} <"; then
+            echo "NPM_TOKEN authenticates as '${NPM_USER}', but that user is not listed as an owner of '${PACKAGE_NAME}'." >&2
+            echo "Update the GitHub secret NPM_TOKEN to a token from an npm owner of '${PACKAGE_NAME}' before publishing." >&2
+            exit 1
+          fi
       - name: Publish to npm
         if: ${{ env.NODE_AUTH_TOKEN != '' }}
         run: npm publish --access public
